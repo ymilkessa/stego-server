@@ -15,9 +15,6 @@ import torch
 # Default model ID - can be overridden by requests
 default_model_id = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
-# Default precision (bits)
-default_precision = 8
-
 # Import the encoding/decoding functions from the raw modules
 from raw_stego_encoder import hex_to_bits, encode_steganographic
 from raw_stego_decoder import bits_to_hex, decode_steganographic
@@ -28,16 +25,15 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-# Global variables for model (loaded once on startup)
-model = None
-tokenizer = None
+# Global model cache - stores loaded models to avoid reloading
+model_cache = {}
 
 # Server-side debugging flag - set to True when you want to debug
 verbose = True
 
 
-def setup_model(model_id=None):
-    """Initialize the model and tokenizer
+def get_model(model_id=None):
+    """Get model and tokenizer, loading and caching if necessary
     
     Args:
         model_id: Hugging Face model identifier. If None, uses default_model_id
@@ -47,12 +43,18 @@ def setup_model(model_id=None):
     """
     if model_id is None:
         model_id = default_model_id
-        
+    
+    # Check if model is already cached
+    if model_id in model_cache:
+        print(f"Using cached model: {model_id}")
+        return model_cache[model_id]
+    
+    # Load model if not in cache
+    print(f"Loading model: {model_id}")
+    
     token = os.getenv('HUGGING_FACE_HUB_TOKEN')
     if not token:
         raise ValueError("HUGGING_FACE_HUB_TOKEN not found in environment variables")
-    
-    print(f"Loading model: {model_id}")
     
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.pad_token = tokenizer.eos_token
@@ -64,7 +66,32 @@ def setup_model(model_id=None):
     )
     
     print(f"Model loaded on device: {model.device}")
+    
+    # Cache the model and tokenizer
+    model_cache[model_id] = (model, tokenizer)
+    print(f"Model cached: {model_id}")
+    
     return model, tokenizer
+
+
+def preload_default_model():
+    """Preload the default model at startup"""
+    try:
+        print("Preloading default model...")
+        get_model(default_model_id)
+        print("Default model preloaded successfully!")
+    except Exception as e:
+        print(f"Warning: Could not preload default model: {e}")
+        print("Model will be loaded on first request.")
+
+
+def get_cache_status():
+    """Get information about cached models"""
+    return {
+        "cached_models": list(model_cache.keys()),
+        "cache_size": len(model_cache),
+        "default_model_cached": default_model_id in model_cache
+    }
 
 
 @app.route('/encode', methods=['POST'])
@@ -78,7 +105,7 @@ def encode_endpoint():
         "start_text": "Hello world...",    // starting text
         "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",  // optional, default from server
         "temp": 1.2,                       // optional, default 1.2
-        "precision": 8,                    // optional, default 8
+        "precision": 16,                   // optional, default 16
         "topk": 50000                      // optional, default 50000
     }
     
@@ -90,7 +117,7 @@ def encode_endpoint():
         "config": {
             "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
             "temp": 1.2,
-            "precision": 8,
+            "precision": 16,
             "topk": 50000
         },
         "stats": {
@@ -121,11 +148,11 @@ def encode_endpoint():
         # Extract optional parameters
         model_id = data.get('model_id', default_model_id)
         temp = data.get('temp', 1.2)
-        precision = data.get('precision', default_precision)
+        precision = data.get('precision', 16)
         topk = data.get('topk', 50000)
         
-        # Setup model with specified model_id
-        model, tokenizer = setup_model(model_id)
+        # Get model from cache (loads if not cached)
+        model, tokenizer = get_model(model_id)
         
         # Convert hex to bits
         message_bits = hex_to_bits(ciphertext_hex)
@@ -183,7 +210,7 @@ def decode_endpoint():
         "starter_length": 25,                            // number of characters in starting text
         "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",  // optional, default from server
         "temp": 1.2,                                     // optional, default 1.2
-        "precision": 8,                                  // optional, default 8
+        "precision": 16,                                 // optional, default 16
         "topk": 50000                                    // optional, default 50000
     }
     
@@ -194,7 +221,7 @@ def decode_endpoint():
         "config": {
             "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
             "temp": 1.2,
-            "precision": 8,
+            "precision": 16,
             "topk": 50000
         },
         "stats": {
@@ -224,7 +251,7 @@ def decode_endpoint():
         # Extract optional parameters
         model_id = data.get('model_id', default_model_id)
         temp = data.get('temp', 1.2)
-        precision = data.get('precision', default_precision)
+        precision = data.get('precision', 16)
         topk = data.get('topk', 50000)
         
         # Validate starter_length
@@ -236,8 +263,8 @@ def decode_endpoint():
         # Extract start_text using the provided starter_length
         start_text = stego_text[:starter_length]
         
-        # Setup model with specified model_id
-        model, tokenizer = setup_model(model_id)
+        # Get model from cache (loads if not cached)
+        model, tokenizer = get_model(model_id)
         
         # Decode steganographically using imported function
         recovered_bits = decode_steganographic(
@@ -282,21 +309,58 @@ def decode_endpoint():
 def health_check():
     """Health check endpoint"""
     try:
-        model, tokenizer = setup_model()
+        # Check if default model is cached, if not try to load it
+        model, tokenizer = get_model()
+        cache_info = get_cache_status()
+        
         return jsonify({
             "success": True,
             "status": "healthy",
             "model_loaded": model is not None,
             "tokenizer_loaded": tokenizer is not None,
             "device": str(model.device) if model else None,
-            "default_model_id": default_model_id
+            "default_model_id": default_model_id,
+            "cache_info": cache_info
         })
     except Exception as e:
         return jsonify({
             "success": False,
             "status": "unhealthy",
             "error": str(e),
-            "default_model_id": default_model_id
+            "default_model_id": default_model_id,
+            "cache_info": get_cache_status()
+        }), 500
+
+@app.route('/cache', methods=['GET'])
+def cache_status():
+    """Get cache status endpoint"""
+    return jsonify({
+        "success": True,
+        "cache_info": get_cache_status()
+    })
+
+@app.route('/cache/clear', methods=['POST'])
+def clear_cache():
+    """Clear model cache endpoint"""
+    try:
+        global model_cache
+        cache_info_before = get_cache_status()
+        
+        # Clear the cache
+        model_cache.clear()
+        
+        cache_info_after = get_cache_status()
+        
+        return jsonify({
+            "success": True,
+            "message": "Cache cleared successfully",
+            "before": cache_info_before,
+            "after": cache_info_after
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
         }), 500
 
 @app.route('/', methods=['GET'])
@@ -306,10 +370,13 @@ def root():
         "name": "Steganographic API Server",
         "version": "1.0.0",
         "default_model_id": default_model_id,
+        "cache_info": get_cache_status(),
         "endpoints": {
             "POST /encode": "Encode hexadecimal ciphertext into steganographic text",
             "POST /decode": "Decode steganographic text back to hexadecimal ciphertext",
             "GET /health": "Health check endpoint",
+            "GET /cache": "Get cache status",
+            "POST /cache/clear": "Clear model cache",
             "GET /": "This documentation"
         },
                  "example_encode": {
@@ -320,7 +387,7 @@ def root():
                  "start_text": "Hello world",
                  "model_id": default_model_id,
                  "temp": 1.2,
-                 "precision": default_precision,
+                 "precision": 16,
                  "topk": 50000
              }
          },
@@ -332,7 +399,7 @@ def root():
                  "starter_length": 25,
                  "model_id": default_model_id,
                  "temp": 1.2,
-                 "precision": default_precision,
+                 "precision": 16,
                  "topk": 50000
              }
          }
@@ -341,14 +408,9 @@ def root():
 if __name__ == '__main__':
     print("Starting Steganographic API Server...")
     print(f"Default model: {default_model_id}")
-    print("Loading model on startup...")
     
-    try:
-        setup_model()
-        print("Model loaded successfully!")
-    except Exception as e:
-        print(f"Warning: Could not load model on startup: {e}")
-        print("Model will be loaded on first request.")
+    # Preload default model for faster first requests
+    preload_default_model()
     
     # Run the server
     port = int(os.getenv('PORT', 3000))
@@ -360,6 +422,8 @@ if __name__ == '__main__':
     print("  POST /encode - Encode ciphertext to steganographic text")
     print("  POST /decode - Decode steganographic text to ciphertext")
     print("  GET /health - Health check")
+    print("  GET /cache - Get cache status")
+    print("  POST /cache/clear - Clear model cache")
     print("  GET / - API documentation")
     
     app.run(host='0.0.0.0', port=port, debug=debug)
