@@ -5,16 +5,8 @@ Decodes already-encrypted ciphertext from natural language text using arithmetic
 No cryptographic keys or nonces required - works with pre-encrypted data
 """
 
-import os
 import torch
 import torch.nn.functional as F
-from dotenv import load_dotenv
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
-# Load environment variables
-load_dotenv()
-
-model_id = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
 def bits2int(bits):
     """Convert bit array to integer (LSB first)"""
@@ -62,26 +54,6 @@ def bits_to_hex(bits):
     
     # Always return as hex string (to match encoder input format)
     return ''.join(f'{b:02x}' for b in bytes_data)
-
-def setup_model():
-    """Initialize the Llama-3 model and tokenizer"""
-    token = os.getenv('HUGGING_FACE_HUB_TOKEN')
-    if not token:
-        raise ValueError("HUGGING_FACE_HUB_TOKEN not found in environment variables")
-    
-    print("Loading Llama-3 model...")
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    tokenizer.pad_token = tokenizer.eos_token
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        device_map="auto"
-    )
-    
-    print(f"Model loaded on device: {model.device}")
-    return model, tokenizer
 
 def decode_steganographic(model, tokenizer, stego_text, context_text, 
                          temp=1.0, precision=16, topk=50000, verbose=False):

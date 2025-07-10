@@ -51,6 +51,7 @@ Encode hexadecimal ciphertext into steganographic text.
 {
   "ciphertext": "48656c6c6f20576f726c64",
   "start_text": "The weather today is quite nice and ",
+  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
   "temp": 1.2,
   "precision": 16,
   "topk": 50000
@@ -60,6 +61,7 @@ Encode hexadecimal ciphertext into steganographic text.
 **Parameters:**
 - `ciphertext` (required): Hexadecimal string to encode
 - `start_text` (required): Starting text for the steganographic output
+- `model_id` (optional): Hugging Face model identifier (default: server's default model)
 - `temp` (optional): Temperature for sampling (default: 1.2)
 - `precision` (optional): Precision for arithmetic coding (default: 16)
 - `topk` (optional): Top-k cutoff for vocabulary (default: 50000)
@@ -70,6 +72,12 @@ Encode hexadecimal ciphertext into steganographic text.
   "success": true,
   "stego_text": "The weather today is quite nice and companies like Microsoft are developing...",
   "starter_length": 36,
+  "config": {
+    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "temp": 1.2,
+    "precision": 16,
+    "topk": 50000
+  },
   "stats": {
     "input_hex_length": 22,
     "input_bytes": 11,
@@ -88,6 +96,7 @@ Decode steganographic text back to hexadecimal ciphertext.
 {
   "stego_text": "The weather today is quite nice and companies like Microsoft are developing...",
   "starter_length": 36,
+  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
   "temp": 1.2,
   "precision": 16,
   "topk": 50000
@@ -97,6 +106,7 @@ Decode steganographic text back to hexadecimal ciphertext.
 **Parameters:**
 - `stego_text` (required): Full steganographic text to decode
 - `starter_length` (required): Number of characters in the starting text (from encode response)
+- `model_id` (optional): Hugging Face model identifier (must match encoding, default: server's default model)
 - `temp` (optional): Temperature (must match encoding, default: 1.2)
 - `precision` (optional): Precision (must match encoding, default: 16)
 - `topk` (optional): Top-k cutoff (must match encoding, default: 50000)
@@ -106,6 +116,12 @@ Decode steganographic text back to hexadecimal ciphertext.
 {
   "success": true,
   "ciphertext": "48656c6c6f20576f726c64",
+  "config": {
+    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "temp": 1.2,
+    "precision": 16,
+    "topk": 50000
+  },
   "stats": {
     "input_length": 245,
     "generated_tokens": 25,
@@ -127,7 +143,8 @@ Check server health and model status.
   "status": "healthy",
   "model_loaded": true,
   "tokenizer_loaded": true,
-  "device": "cuda:0"
+  "device": "cuda:0",
+  "default_model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 }
 ```
 
@@ -155,7 +172,8 @@ curl -X POST http://localhost:3000/encode \
   -H "Content-Type: application/json" \
   -d '{
     "ciphertext": "48656c6c6f20576f726c64",
-    "start_text": "The weather today is quite nice and "
+    "start_text": "The weather today is quite nice and ",
+    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
   }'
 ```
 
@@ -165,7 +183,8 @@ curl -X POST http://localhost:3000/decode \
   -H "Content-Type: application/json" \
   -d '{
     "stego_text": "The weather today is quite nice and companies like Microsoft are developing...",
-    "starter_length": 36
+    "starter_length": 36,
+    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
   }'
 ```
 
@@ -178,17 +197,20 @@ import json
 # Encode
 encode_data = {
     "ciphertext": "48656c6c6f20576f726c64",
-    "start_text": "The weather today is quite nice and "
+    "start_text": "The weather today is quite nice and ",
+    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 }
 response = requests.post("http://localhost:3000/encode", json=encode_data)
 result = response.json()
 stego_text = result["stego_text"]
 starter_length = result["starter_length"]
+model_id = result["config"]["model_id"]
 
 # Decode
 decode_data = {
     "stego_text": stego_text,
-    "starter_length": starter_length
+    "starter_length": starter_length,
+    "model_id": model_id
 }
 response = requests.post("http://localhost:3000/decode", json=decode_data)
 result = response.json()
@@ -197,7 +219,7 @@ recovered_ciphertext = result["ciphertext"]
 
 ## Important Notes
 
-1. **Parameter Consistency**: All parameters used for encoding (temp, precision, topk) must be exactly the same for decoding to work correctly.
+1. **Parameter Consistency**: All parameters used for encoding (model_id, temp, precision, topk) must be exactly the same for decoding to work correctly.
 
 2. **Model Loading**: The model is loaded once on startup. First requests may be slower while the model initializes.
 

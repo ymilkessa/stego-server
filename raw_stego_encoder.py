@@ -14,8 +14,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # Load environment variables
 load_dotenv()
 
-model_id = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-
 def bits2int(bits):
     """Convert bit array to integer (LSB first)"""
     res = 0
@@ -59,26 +57,6 @@ def hex_to_bits(hex_string):
         message_bits.extend(byte_bits)
     
     return message_bits
-
-def setup_model():
-    """Initialize the Llama-3 model and tokenizer"""
-    token = os.getenv('HUGGING_FACE_HUB_TOKEN')
-    if not token:
-        raise ValueError("HUGGING_FACE_HUB_TOKEN not found in environment variables")
-    
-    print("Loading Llama-3 model...")
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    tokenizer.pad_token = tokenizer.eos_token
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        device_map="auto"
-    )
-    
-    print(f"Model loaded on device: {model.device}")
-    return model, tokenizer
 
 def encode_steganographic(model, tokenizer, message_bits, context_text, 
                          temp=1.0, precision=16, topk=50000, verbose=False):
@@ -190,9 +168,9 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
                 message_idx = message_idx * scale_factor
             
             # Special handling for 50% boundary conditions (patterns like [1,0,...])
-            # Check if this maps to exactly 50% of the current range
+            # Check if this maps to close to 50% of the current range. e.g. 1,0,0,0,1.
             is_fifty_percent = False
-            if message_chunk[0] == 1 and all(bit == 0 for bit in message_chunk[1:]):
+            if message_chunk[0] == 1 and all(bit == 0 for bit in message_chunk[1:4]):
                 is_fifty_percent = True
                 # Shift to 75% point to encode just the first '1' bit
                 message_idx = cur_int_range * 3 // 4  # 75% point
