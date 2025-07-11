@@ -1,20 +1,6 @@
 # Server for StegoNote
 
-A Flask-based HTTP server that provides REST API endpoints for encoding and decoding steganographic text using LLMs.
-
-## Features
-
-- **POST /encode**: Encode hexadecimal ciphertext into natural language steganographic text
-- **POST /decode**: Decode steganographic text back to hexadecimal ciphertext  
-- **GET /health**: Health check endpoint
-- **GET /cache**: Get model cache status
-- **POST /cache/clear**: Clear model cache
-- **GET /**: API documentation
-- CORS enabled for cross-origin requests
-- Intelligent model caching system for optimal performance
-- Default model preloaded on startup for faster first requests
-- Support for multiple models with automatic caching
-- Comprehensive error handling and logging
+Server for encoding and decoding steganographic texts for the [StegaNote](https://steganote.com) app. The app, and this server, are based on the Meteor protocol.
 
 ## Setup
 
@@ -55,7 +41,7 @@ Encode hexadecimal ciphertext into steganographic text.
 {
   "ciphertext": "48656c6c6f20576f726c64",
   "start_text": "The weather today is quite nice and ",
-  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+  "model_id": "meta-llama/Llama-3.2-1B",
   "temp": 1.2,
   "precision": 16,
   "topk": 50000
@@ -77,7 +63,7 @@ Encode hexadecimal ciphertext into steganographic text.
   "stego_text": "The weather today is quite nice and companies like Microsoft are developing...",
   "starter_length": 36,
   "config": {
-    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "model_id": "meta-llama/Llama-3.2-1B",
     "temp": 1.2,
     "precision": 16,
     "topk": 50000
@@ -100,7 +86,7 @@ Decode steganographic text back to hexadecimal ciphertext.
 {
   "stego_text": "The weather today is quite nice and companies like Microsoft are developing...",
   "starter_length": 36,
-  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+  "model_id": "meta-llama/Llama-3.2-1B",
   "temp": 1.2,
   "precision": 16,
   "topk": 50000
@@ -121,7 +107,7 @@ Decode steganographic text back to hexadecimal ciphertext.
   "success": true,
   "ciphertext": "48656c6c6f20576f726c64",
   "config": {
-    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "model_id": "meta-llama/Llama-3.2-1B",
     "temp": 1.2,
     "precision": 16,
     "topk": 50000
@@ -148,9 +134,9 @@ Check server health and model status.
   "model_loaded": true,
   "tokenizer_loaded": true,
   "device": "cuda:0",
-  "default_model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+  "default_model_id": "meta-llama/Llama-3.2-1B",
   "cache_info": {
-    "cached_models": ["deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"],
+    "cached_models": ["meta-llama/Llama-3.2-1B"],
     "cache_size": 1,
     "default_model_cached": true
   }
@@ -166,7 +152,7 @@ Get information about cached models.
 {
   "success": true,
   "cache_info": {
-    "cached_models": ["deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"],
+    "cached_models": ["meta-llama/Llama-3.2-1B"],
     "cache_size": 1,
     "default_model_cached": true
   }
@@ -183,7 +169,7 @@ Clear all cached models to free up memory.
   "success": true,
   "message": "Cache cleared successfully",
   "before": {
-    "cached_models": ["deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"],
+    "cached_models": ["meta-llama/Llama-3.2-1B"],
     "cache_size": 1,
     "default_model_cached": true
   },
@@ -199,16 +185,6 @@ Clear all cached models to free up memory.
 
 Get API documentation and examples.
 
-## Testing
-
-Run the test suite to verify the server is working correctly:
-
-```bash
-pipenv run python test_server.py
-```
-
-This will test all endpoints and verify that encoding/decoding works properly.
-
 ## Usage Examples
 
 ### Using curl
@@ -220,7 +196,7 @@ curl -X POST http://localhost:3000/encode \
   -d '{
     "ciphertext": "48656c6c6f20576f726c64",
     "start_text": "The weather today is quite nice and ",
-    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    "model_id": "meta-llama/Llama-3.2-1B"
   }'
 ```
 
@@ -231,7 +207,7 @@ curl -X POST http://localhost:3000/decode \
   -d '{
     "stego_text": "The weather today is quite nice and companies like Microsoft are developing...",
     "starter_length": 36,
-    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    "model_id": "meta-llama/Llama-3.2-1B"
   }'
 ```
 
@@ -245,7 +221,7 @@ import json
 encode_data = {
     "ciphertext": "48656c6c6f20576f726c64",
     "start_text": "The weather today is quite nice and ",
-    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    "model_id": "meta-llama/Llama-3.2-1B"
 }
 response = requests.post("http://localhost:3000/encode", json=encode_data)
 result = response.json()
@@ -264,54 +240,11 @@ result = response.json()
 recovered_ciphertext = result["ciphertext"]
 ```
 
-## Important Notes
-
-1. **Parameter Consistency**: All parameters used for encoding (model_id, temp, precision, topk) must be exactly the same for decoding to work correctly.
-
-2. **Model Caching**: Models are cached after first use for optimal performance. The default model is preloaded on startup, so first requests are fast. Different models are cached separately.
-
-3. **Memory Usage**: The DeepSeek model requires significant GPU memory. Ensure you have adequate VRAM available.
-
-4. **Error Handling**: The server includes comprehensive error handling and will return detailed error messages for debugging.
-
-5. **CORS**: Cross-origin requests are enabled by default for web application integration.
-
-## Model Caching System
-
-The server implements an intelligent caching system to optimize performance:
-
-### How It Works
-- **Default Model Preloading**: The default model is loaded automatically on server startup
-- **Lazy Loading**: Additional models are loaded only when first requested
-- **Persistent Caching**: Models stay in memory between requests for fast subsequent access
-- **Multi-Model Support**: Different models are cached separately, allowing you to switch between them efficiently
-
-### Performance Benefits
-- **Fast First Requests**: Default model is ready immediately
-- **No Redundant Loading**: Same models are never loaded twice
-- **Memory Efficient**: Only requested models are kept in memory
-- **Scalable**: Can handle multiple different models simultaneously
-
-### Cache Management
-- **View Cache Status**: Use `GET /cache` to see which models are cached
-- **Clear Cache**: Use `POST /cache/clear` to free memory when needed
-- **Automatic Cleanup**: Cache persists until server restart or manual clearing
-
 ## Troubleshooting
 
 **Model Loading Issues:**
 - Ensure your Hugging Face token is valid and set in the `.env` file
-- Check that you have sufficient GPU memory available
+- Check that you have access to the model on Huggingface
 - Verify PyTorch CUDA installation if using GPU
 - Use `GET /cache` to check which models are currently loaded
 - Use `POST /cache/clear` to free memory if experiencing out-of-memory issues
-
-**Encoding/Decoding Failures:**
-- Ensure all parameters match between encoding and decoding
-- Check that the starter_length exactly matches the value returned from encoding
-- Verify the hex string is properly formatted (even length, valid hex characters)
-
-**Server Startup Issues:**
-- Check that the port is not already in use
-- Verify all dependencies are installed correctly with `pipenv install`
-- Review the server logs for specific error messages 

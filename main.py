@@ -105,7 +105,7 @@ def encode_endpoint():
     {
         "ciphertext": "5361486a4b31593d",  // hex string
         "start_text": "Hello world...",    // starting text
-        "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",  // optional, default from server
+        "model_id": "meta-llama/Llama-3.2-1B",  // optional, default from server
         "temp": 1.2,                       // optional, default 1.2
         "precision": 16,                   // optional, default 16
         "topk": 50000                      // optional, default 50000
@@ -117,7 +117,7 @@ def encode_endpoint():
         "stego_text": "Hello world companies like...",
         "starter_length": 25,              // length of starting text in characters
         "config": {
-            "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+            "model_id": "meta-llama/Llama-3.2-1B",
             "temp": 1.2,
             "precision": 16,
             "topk": 50000
@@ -210,7 +210,7 @@ def decode_endpoint():
     {
         "stego_text": "Hello world companies like...",  // full steganographic text
         "starter_length": 25,                            // number of characters in starting text
-        "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",  // optional, default from server
+        "model_id": "meta-llama/Llama-3.2-1B",  // optional, default from server
         "temp": 1.2,                                     // optional, default 1.2
         "precision": 16,                                 // optional, default 16
         "topk": 50000                                    // optional, default 50000
@@ -221,7 +221,7 @@ def decode_endpoint():
         "success": true,
         "ciphertext": "5361486a4b31593d",  // recovered hex string
         "config": {
-            "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+            "model_id": "meta-llama/Llama-3.2-1B",
             "temp": 1.2,
             "precision": 16,
             "topk": 50000
