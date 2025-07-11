@@ -13,7 +13,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 
 # Default model ID - can be overridden by requests
-default_model_id = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+# default_model_id = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+# default_model_id = "openai-community/gpt2"
+default_model_id = "meta-llama/Llama-3.2-1B"
 
 # Import the encoding/decoding functions from the raw modules
 from raw_stego_encoder import hex_to_bits, encode_steganographic
