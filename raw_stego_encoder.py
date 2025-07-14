@@ -86,6 +86,7 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
     
     max_val = 2**precision
     cur_interval = [0, max_val]  # bottom inclusive, top exclusive
+    threshold = 1 / max_val
     
     output_tokens = context_tokens.clone()
     
@@ -103,6 +104,17 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
     with torch.no_grad():
         i = 0
         while i < len(message_bits):
+            # Get message bits for this iteration (no masking - direct encoding)
+            message_chunk = message_bits[i:i+precision]
+            actual_bits = len(message_chunk)
+            
+            if actual_bits == 0:
+                break  # No more bits to encode
+
+            # Pad zeros to trailing bits of message chunk
+            if actual_bits < precision:
+                message_chunk = message_chunk + ([0] * (precision - actual_bits))
+
             # Get model predictions (disable caching for compatibility)
             outputs = model(output_tokens, use_cache=False)
             logits = outputs.logits[:, -1, :]  # Get logits for last token
@@ -116,12 +128,8 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
             probs_temp_sorted = probs_temp_sorted.squeeze(0)
             indices = indices.squeeze(0)
             
-            # Cutoff low probabilities
-            cur_int_range = cur_interval[1] - cur_interval[0]
-            cur_threshold = 1 / cur_int_range
-            
             # Find cutoff point
-            cutoff_mask = probs_temp_sorted >= cur_threshold
+            cutoff_mask = probs_temp_sorted >= threshold
             k = min(max(2, cutoff_mask.sum().item()), topk)
             
             # Take top-k tokens
@@ -129,40 +137,24 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
             indices = indices[:k]
             
             # Rescale to integer range
-            probs_temp_int = probs_temp_int / probs_temp_int.sum() * cur_int_range
+            probs_temp_int = probs_temp_int / probs_temp_int.sum() * max_val
             
             # Round to integers
             probs_temp_int = probs_temp_int.round().long()
             cum_probs = probs_temp_int.cumsum(0)
             
             # Handle overflow
-            overfill_index = (cum_probs > cur_int_range).nonzero()
+            overfill_index = (cum_probs > max_val).nonzero()
             if len(overfill_index) > 0:
                 cum_probs = cum_probs[:overfill_index[0]]
                 indices = indices[:overfill_index[0]]
             
             # Add missing mass to top
             if len(cum_probs) > 0:
-                cum_probs += cur_int_range - cum_probs[-1]
-            
-            # Convert to position in range
-            cum_probs += cur_interval[0]
-            
-            # Get message bits for this iteration (no masking - direct encoding)
-            message_chunk = message_bits[i:i+precision]
-            actual_bits = len(message_chunk)
-            
-            if actual_bits == 0:
-                break  # No more bits to encode
+                cum_probs += max_val - cum_probs[-1]
             
             # Convert message bits to selection index (no padding)
             message_idx = bits2int(list(reversed(message_chunk)))
-            
-            # Scale the index to the current range based on actual bit count
-            if actual_bits < precision:
-                max_val_for_chunk = 2**actual_bits
-                scale_factor = cur_int_range // max_val_for_chunk
-                message_idx = message_idx * scale_factor
             
             # Find which cumulative probability bin contains our message index
             selection_idx = 0
@@ -187,7 +179,7 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
                 # Check for 50% boundary conditions (patterns like [1,0,...])
                 if message_chunk[0] == 1 and all(bit == 0 for bit in message_chunk[1:4]):
                     hack_applied = True
-                    message_idx = cur_int_range * 3 // 4  # 75% point
+                    message_idx = max_val * 3 // 4  # 75% point
                     actual_bits = 1  # Only encode the first bit
                     message_chunk = [1]  # Only process the first bit
                     

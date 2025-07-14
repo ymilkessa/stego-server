@@ -31,7 +31,7 @@ CORS(app)  # Enable CORS for all routes
 model_cache = {}
 
 # Server-side debugging flag - set to True when you want to debug
-verbose = True
+verbose = False
 
 
 def get_model(model_id=None):
