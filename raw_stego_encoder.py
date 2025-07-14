@@ -122,10 +122,7 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
             
             # Find cutoff point
             cutoff_mask = probs_temp_sorted >= cur_threshold
-            if cutoff_mask.sum() == 0:
-                k = 2  # Minimum 2 tokens
-            else:
-                k = min(max(2, cutoff_mask.sum().item()), topk)
+            k = min(max(2, cutoff_mask.sum().item()), topk)
             
             # Take top-k tokens
             probs_temp_int = probs_temp_sorted[:k]
@@ -167,16 +164,6 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
                 scale_factor = cur_int_range // max_val_for_chunk
                 message_idx = message_idx * scale_factor
             
-            # Special handling for 50% boundary conditions (patterns like [1,0,...])
-            # Check if this maps to close to 50% of the current range. e.g. 1,0,0,0,1.
-            is_fifty_percent = False
-            if message_chunk[0] == 1 and all(bit == 0 for bit in message_chunk[1:4]):
-                is_fifty_percent = True
-                # Shift to 75% point to encode just the first '1' bit
-                message_idx = cur_int_range * 3 // 4  # 75% point
-                actual_bits = 1  # Only encode the first bit
-                message_chunk = [1]  # Only process the first bit
-            
             # Find which cumulative probability bin contains our message index
             selection_idx = 0
             for j, cum_prob in enumerate(cum_probs):
@@ -194,6 +181,31 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
             
             # Count bits that can be consumed
             num_bits_encoded = num_same_from_beg(new_int_bottom_bits, new_int_top_bits)
+
+            hack_applied = False
+            if num_bits_encoded == 0:
+                # Check for 50% boundary conditions (patterns like [1,0,...])
+                if message_chunk[0] == 1 and all(bit == 0 for bit in message_chunk[1:4]):
+                    hack_applied = True
+                    message_idx = cur_int_range * 3 // 4  # 75% point
+                    actual_bits = 1  # Only encode the first bit
+                    message_chunk = [1]  # Only process the first bit
+                    
+                    # Recalculate selection with the hacked message_idx
+                    selection_idx = 0
+                    for j, cum_prob in enumerate(cum_probs):
+                        if cum_prob > message_idx:
+                            selection_idx = j
+                            break
+                    
+                    # Recalculate interval boundaries
+                    new_int_bottom = cum_probs[selection_idx-1].item() if selection_idx > 0 else cur_interval[0]
+                    new_int_top = cum_probs[selection_idx].item()
+                    
+                    # Recalculate bits encoded
+                    new_int_bottom_bits = list(reversed(int2bits(new_int_bottom, precision)))
+                    new_int_top_bits = list(reversed(int2bits(new_int_top-1, precision)))
+                    num_bits_encoded = num_same_from_beg(new_int_bottom_bits, new_int_top_bits)
             
             # Select the token
             selected_token = indices[selection_idx].unsqueeze(0).unsqueeze(0)
@@ -234,7 +246,7 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
                 print(f"  Bits remaining: {bits_remaining}/{len(message_bits)} ({bits_remaining/len(message_bits)*100:.1f}% left)")
                 print(f"  Token rank: {selection_idx + 1}/{len(indices)} (prob: {token_prob:.6f})")
                 print(f"  Interval: [{new_int_bottom}, {new_int_top}) = [{prob_bottom:.6f}, {prob_top:.6f}) width: {prob_width:.6f}")
-                if is_fifty_percent:
+                if hack_applied:
                     print(f"  Message index: {message_idx} (50% boundary detected - using 75% point for first bit)")
                 elif actual_bits < precision:
                     print(f"  Message index: {message_idx} (scaled from {bits2int(list(reversed(message_chunk)))} for {actual_bits} bits)")
