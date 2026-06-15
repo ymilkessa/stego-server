@@ -5,6 +5,8 @@ Provides REST API endpoints for encoding and decoding steganographic text
 """
 
 import os
+import argparse
+import threading
 import traceback
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -32,6 +34,15 @@ model_cache = {}
 
 # Server-side debugging flag - set to True when you want to debug
 verbose = False
+
+# Optional step-by-step GUI bridge (set when started with --add-gui)
+GUI_BRIDGE = None
+
+
+def set_gui_bridge(bridge):
+    """Register the GUI bridge so /encode drives the step visualizer."""
+    global GUI_BRIDGE
+    GUI_BRIDGE = bridge
 
 
 def get_model(model_id=None):
@@ -158,19 +169,36 @@ def encode_endpoint():
         
         # Convert hex to bits
         message_bits = hex_to_bits(ciphertext_hex)
-        
-        # Encode steganographically using imported function
-        print(f"Encoding steganographic text...")
-        generated_tokens = encode_steganographic(
-            model, tokenizer, message_bits, start_text, 
-            temp=temp, precision=precision, topk=topk, verbose=verbose
-        )
-        print(f"Just finished encoding steganographic text...")
 
-        
-        # Decode and create full steganographic text
-        generated_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-        full_stego_text = start_text + generated_text
+        # When the GUI is attached, drive it step-by-step (one encode at a time).
+        gui = GUI_BRIDGE
+        step_hook = None
+        if gui is not None:
+            if not gui.session_lock.acquire(blocking=False):
+                return jsonify({"success": False,
+                                "error": "GUI is busy visualizing another encode"}), 409
+            gui.begin_session({"ciphertext": ciphertext_hex, "start_text": start_text})
+            step_hook = gui.hook
+
+        try:
+            # Encode steganographically using imported function
+            print(f"Encoding steganographic text...")
+            generated_tokens = encode_steganographic(
+                model, tokenizer, message_bits, start_text,
+                temp=temp, precision=precision, topk=topk, verbose=verbose,
+                step_hook=step_hook
+            )
+            print(f"Just finished encoding steganographic text...")
+
+            # Decode and create full steganographic text
+            generated_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+            full_stego_text = start_text + generated_text
+
+            if gui is not None:
+                gui.end_session(full_stego_text)
+        finally:
+            if gui is not None:
+                gui.session_lock.release()
         
         # Prepare response
         response = {
@@ -408,16 +436,21 @@ def root():
     })
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Steganographic API Server")
+    parser.add_argument('--add-gui', action='store_true',
+                        help="Launch a step-by-step encoding visualizer window")
+    args = parser.parse_args()
+
     print("Starting Steganographic API Server...")
     print(f"Default model: {default_model_id}")
-    
+
     # Preload default model for faster first requests
     preload_default_model()
-    
+
     # Run the server
     port = int(os.getenv('PORT', 3000))
     debug = os.getenv('DEBUG', 'False').lower() == 'true'
-    
+
     print(f"Server starting on port {port}")
     print(f"Server URL: http://localhost:{port}")
     print("Available endpoints:")
@@ -427,5 +460,24 @@ if __name__ == '__main__':
     print("  GET /cache - Get cache status")
     print("  POST /cache/clear - Clear model cache")
     print("  GET / - API documentation")
-    
-    app.run(host='0.0.0.0', port=port, debug=debug)
+
+    if args.add_gui:
+        # Tkinter must own the main thread (required on macOS), so the Flask
+        # server runs on a background thread and the GUI blocks here.
+        from gui import GuiBridge, run_gui
+
+        bridge = GuiBridge()
+        set_gui_bridge(bridge)
+
+        server_thread = threading.Thread(
+            target=lambda: app.run(host='0.0.0.0', port=port, debug=False,
+                                   use_reloader=False, threaded=True),
+            daemon=True,
+        )
+        server_thread.start()
+
+        print("GUI mode: a visualizer window is open. Send an /encode request "
+              "to step through encoding.")
+        run_gui(bridge, port)
+    else:
+        app.run(host='0.0.0.0', port=port, debug=debug)

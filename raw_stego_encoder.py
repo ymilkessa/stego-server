@@ -58,11 +58,12 @@ def hex_to_bits(hex_string):
     
     return message_bits
 
-def encode_steganographic(model, tokenizer, message_bits, context_text, 
-                         temp=1.0, precision=16, topk=50000, verbose=False):
+def encode_steganographic(model, tokenizer, message_bits, context_text,
+                         temp=1.0, precision=16, topk=50000, verbose=False,
+                         step_hook=None):
     """
     Encode message bits into text using steganographic arithmetic coding
-    
+
     Args:
         model: The language model
         tokenizer: The tokenizer
@@ -72,7 +73,12 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
         precision: Precision for arithmetic coding
         topk: Top-k cutoff for vocabulary
         verbose: Show detailed token selection information
-    
+        step_hook: Optional callable(step_payload: dict). Invoked once per
+            encoding step with everything needed to visualize that step
+            (candidate tokens, their binary probability ranges, the selection,
+            and the bits encoded). The call may block (e.g. the GUI waits for
+            the user), which pauses encoding until it returns.
+
     Returns:
         Generated text tokens (continuation of context)
     """
@@ -103,6 +109,7 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
     
     with torch.no_grad():
         i = 0
+        step_counter = 0
         while i < len(message_bits):
             # Get message bits for this iteration (no masking - direct encoding)
             message_chunk = message_bits[i:i+precision]
@@ -114,6 +121,9 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
             # Pad zeros to trailing bits of message chunk
             if actual_bits < precision:
                 message_chunk = message_chunk + ([0] * (precision - actual_bits))
+
+            # Snapshot the (unhacked) chunk for visualization before any rewrite
+            original_chunk = list(message_chunk)
 
             # Get model predictions (disable caching for compatibility)
             outputs = model(output_tokens, use_cache=False)
@@ -247,8 +257,53 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
                 print(f"  Stego-note: {generated_text_so_far}")
                 print()
             
+            # GUI/step hook: surface everything about this step so a visualizer
+            # can show the candidate tokens, their binary probability ranges,
+            # the selection, and the bits actually consumed.
+            if step_hook is not None:
+                step_counter += 1
+                max_display = 60
+                n_cand = len(cum_probs)
+                show = list(range(min(n_cand, max_display)))
+                if selection_idx not in show:
+                    show.append(selection_idx)
+                candidates = []
+                for j in show:
+                    lo = cum_probs[j - 1].item() if j > 0 else 0
+                    hi = cum_probs[j].item()
+                    lo_bits = list(reversed(int2bits(lo, precision)))
+                    hi_bits = list(reversed(int2bits(hi - 1, precision)))
+                    shared = num_same_from_beg(lo_bits, hi_bits)
+                    candidates.append({
+                        "rank": j,
+                        "word": tokenizer.decode([indices[j].item()]),
+                        "lo": lo,
+                        "hi": hi,
+                        "lo_bits": "".join(map(str, lo_bits)),
+                        "hi_bits": "".join(map(str, hi_bits)),
+                        "fixes": shared,
+                        "prefix": "".join(map(str, hi_bits[:shared])),
+                        "prob": probs_temp_sorted[j].item() if j < len(probs_temp_sorted) else 0.0,
+                    })
+                step_hook({
+                    "step": step_counter,
+                    "precision": precision,
+                    "message_bits": list(message_bits),
+                    "pos": i,
+                    "chunk": original_chunk,
+                    "selection_idx": selection_idx,
+                    "num_bits_encoded": num_bits_encoded,
+                    "encoded_bits": list(message_bits[i:i + num_bits_encoded]),
+                    "hack_applied": hack_applied,
+                    "candidates": candidates,
+                    "total_candidates": n_cand,
+                    "bits_before": i,
+                    "bits_after": i + num_bits_encoded,
+                    "total_message_bits": len(message_bits),
+                })
+
             i += num_bits_encoded
-            
+
             # Progress indicator (only if not verbose to avoid clutter)
             if not verbose and i % 50 == 0:
                 print(f"Encoded {i}/{len(message_bits)} bits...")

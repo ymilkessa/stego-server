@@ -1,1 +1,6 @@
 .env
+.test_keys
+
+CLAUDE.md
+EDGE_CASES.md
+meteor_p_1-15.tex
