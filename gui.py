@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """
-Optional step-by-step encoding visualizer for the steganographic server.
+Optional step-by-step encode/decode visualizer for the steganographic server.
 
 Enabled with `python main.py --add-gui`. The Flask server runs on a background
 thread; this Tkinter GUI runs on the main thread (required on macOS). When an
-/encode request arrives, the encoder calls back into `GuiBridge.hook` once per
-step, which hands the step to the GUI and blocks until the user advances.
+/encode or /decode request arrives (and the GUI is not already busy), the
+encoder/decoder calls back into `GuiBridge.hook` once per token, which hands
+the step to the GUI and blocks until the user advances. The same window serves
+both directions; a single session lock guarantees one request is visualized at
+a time (a concurrent request gets HTTP 409).
 
-Flow per step:
+Encode flow per step:
   1. The model's candidate tokens and their binary probability ranges are shown
-     (the selection is hidden). The user inspects, then clicks "Next".
-  2. "Next" reveals the selected token and the bits actually encoded.
+     together with the random bit value (message ⊕ per-token mask) that drives
+     the selection. The selected token is hidden. The user inspects, clicks
+     "Next".
+  2. "Next" reveals which token that random value selected and the bits encoded.
   3. "Next" again resumes the encoder, which computes the following step.
 
-"Finish" fast-forwards without pausing and shows the final stego text.
+Decode flow per step (the reverse): the full stego-text is shown at the top with
+the current word highlighted. Each step shows the model's candidates; "Next"
+reveals which candidate is the actual next word in the stego-text and how many
+message bits that token choice recovers.
+
+"Finish" fast-forwards without pausing and shows the final result (the stego
+text when encoding, the recovered message when decoding).
 """
 
 import queue
@@ -81,8 +92,13 @@ class StegoGui:
         self.current = None     # current step payload awaiting user
         self.phase = 0          # 0 idle, 1 options shown, 2 selection revealed
         self.item_to_rank = {}
+        self.mode = "encode"    # "encode" or "decode" — set on each session
+        self._bits_word = "encoded"
+        self.stego_text = ""    # decode: full stego text shown at the top
+        self.starter_len = 0    # decode: chars of starter prefix (greyed out)
+        self.decoded_bits = []  # decode: running list of recovered message bits
 
-        root.title("Meteor stego encoder — step visualizer")
+        root.title("Meteor stego — step visualizer (encode / decode)")
         root.geometry("980x720")
         self._build()
         self._set_idle()
@@ -110,9 +126,10 @@ class StegoGui:
         body = ttk.LabelFrame(self.root, text="Current encoding step", padding=8)
         body.pack(fill="both", expand=True, padx=8, pady=4)
 
-        ttk.Label(body, text="Bit sequence being encoded "
-                  "(grey = done, bold = current window, green = just encoded):"
-                  ).pack(anchor="w")
+        self.top_label_var = tk.StringVar(
+            value="Bit sequence being encoded "
+            "(grey = done, bold = current window, green = just encoded):")
+        ttk.Label(body, textvariable=self.top_label_var).pack(anchor="w")
         self.bits_text = tk.Text(body, height=4, wrap="char",
                                  font=("Menlo", 12))
         self.bits_text.pack(fill="x", pady=(2, 8))
@@ -154,7 +171,7 @@ class StegoGui:
 
         self.hack_var = tk.StringVar(value="")
         self.hack_lbl = tk.Label(body, textvariable=self.hack_var,
-                                 fg="#b00000", font=("TkDefaultFont", 12, "bold"))
+                                 fg="#3060a0", font=("Menlo", 11))
         self.hack_lbl.pack(anchor="w")
 
         self.next_btn = ttk.Button(body, text="Next ▸", command=self._on_next)
@@ -178,18 +195,33 @@ class StegoGui:
         self.next_btn.configure(state="disabled", text="Next ▸")
         self.finish_btn.configure(state="disabled")
         self.status_var.set(
-            f"Waiting for an /encode request… "
-            f"(POST to http://localhost:{self.port}/encode)")
+            f"Waiting for an /encode or /decode request… "
+            f"(POST to http://localhost:{self.port})")
 
     def _reset_counters(self, info):
+        self.mode = info.get("mode", "encode")
+        self._bits_word = "decoded" if self.mode == "decode" else "encoded"
         self.step_var.set("Steps: 0")
-        self.bits_var.set("Bits encoded: 0")
+        self.bits_var.set(f"Bits {self._bits_word}: 0")
+        self.decoded_bits = []
         self._clear_step()
         self._set_output("")
-        ct = info.get("ciphertext", "")
-        st = info.get("start_text", "")
-        self.status_var.set(f"Encoding started — ciphertext={ct!r}  "
-                            f"start_text={st!r}")
+        if self.mode == "decode":
+            self.stego_text = info.get("stego_text", "")
+            self.starter_len = len(info.get("start_text", ""))
+            self.top_label_var.set(
+                "Stego-text being decoded "
+                "(grey = starter, bold = current word, green = just decoded):")
+            preview = self.stego_text[:60]
+            self.status_var.set(f"Decoding started — stego_text={preview!r}…")
+        else:
+            self.top_label_var.set(
+                "Bit sequence being encoded "
+                "(grey = done, bold = current window, green = just encoded):")
+            msg = info.get("message", "")
+            st = info.get("start_text", "")
+            self.status_var.set(f"Encoding started — message={msg!r}  "
+                                f"start_text={st!r}")
         self.finish_btn.configure(state="normal")
 
     def _clear_step(self):
@@ -228,21 +260,38 @@ class StegoGui:
     def _handle_step(self, payload):
         # Keep counters live even while fast-forwarding.
         self.step_var.set(f"Steps: {payload['step']}")
+        # The hook fires exactly once per token; accumulate the recovered bits
+        # here so they stream into the bottom pane (and survive fast-forward).
+        if self.mode == "decode":
+            self.decoded_bits.extend(payload.get("recovered_bits", []))
         if self.bridge.is_finishing():
-            self.bits_var.set(f"Bits encoded: {payload['bits_after']}")
+            self.bits_var.set(f"Bits {self._bits_word}: {payload['bits_after']}")
             self.status_var.set("Fast-forwarding…")
+            if self.mode == "decode":
+                self._show_decoded_bits(payload['bits_after'])
             return
         self.current = payload
         self.phase = 1
         self._render_step(payload, reveal=False)
-        self.next_btn.configure(state="normal", text="Next ▸  (reveal selection)")
-        self.status_var.set(
-            f"Step {payload['step']}: {payload['total_candidates']} candidate "
-            f"token(s). Inspect the ranges, then click Next.")
+        if self.mode == "decode":
+            self.next_btn.configure(state="normal",
+                                    text="Next ▸  (reveal next word)")
+            self.status_var.set(
+                f"Step {payload['step']}: {payload['total_candidates']} candidate "
+                f"token(s). Which is the next word? Click Next to reveal.")
+        else:
+            self.next_btn.configure(state="normal",
+                                    text="Next ▸  (reveal selection)")
+            self.status_var.set(
+                f"Step {payload['step']}: {payload['total_candidates']} candidate "
+                f"token(s). Inspect the ranges + random value, then click Next.")
 
     def _handle_end(self, final_text):
         self._clear_step()
-        self.status_var.set("Encoding complete. Final stego text:")
+        if self.mode == "decode":
+            self.status_var.set("Decoding complete. Recovered message:")
+        else:
+            self.status_var.set("Encoding complete. Final stego text:")
         self._set_output(final_text)
         self._set_idle()
         # keep counters as-is so the user can read the totals
@@ -250,23 +299,96 @@ class StegoGui:
     # ---- rendering ------------------------------------------------------ #
     def _render_step(self, payload, reveal):
         self.bits_var.set(
-            f"Bits encoded: {payload['bits_after'] if reveal else payload['bits_before']}")
-        self._render_bits(payload, reveal)
+            f"Bits {self._bits_word}: "
+            f"{payload['bits_after'] if reveal else payload['bits_before']}")
+        if self.mode == "decode":
+            self._render_stego(payload, reveal)
+        else:
+            self._render_bits(payload, reveal)
         self._render_candidates(payload, reveal)
+        if self.mode == "decode":
+            self._render_reveal_decode(payload, reveal)
+            # Bottom pane: bits recovered so far. Before the reveal, exclude the
+            # current (still-hidden) token; on reveal, include it.
+            n = payload["bits_after"] if reveal else payload["bits_before"]
+            self._show_decoded_bits(n)
+        else:
+            self._render_reveal_encode(payload, reveal)
+
+    def _show_decoded_bits(self, n):
+        """Decode mode: write the first `n` recovered bits to the bottom pane,
+        grouped into bytes for readability."""
+        bits = self.decoded_bits[:n]
+        grouped = " ".join("".join(map(str, bits[i:i + 8]))
+                           for i in range(0, len(bits), 8))
+        self._set_output(f"Decoded bits so far ({len(bits)}):\n{grouped}")
+
+    def _render_reveal_encode(self, payload, reveal):
+        # The random value (message ⊕ per-token mask) drives the selection, so
+        # it is shown in BOTH phases — only the resulting token is hidden until
+        # the user clicks Next.
+        if payload.get("mask") is not None:
+            self.hack_var.set(
+                f"random value sampled (message ⊕ mask): "
+                f"{''.join(map(str, payload['coding_chunk']))}   "
+                f"[mask: {''.join(map(str, payload['mask']))}]")
+        else:
+            self.hack_var.set("")
         if reveal:
             sel = payload["candidates_by_rank"].get(payload["selection_idx"])
             word = sel["word"] if sel else "?"
             enc = "".join(map(str, payload["encoded_bits"])) or "(none — 0 bits)"
             self.reveal_var.set(
-                f"Selected token: {word!r}    →    encoded bits: {enc}    "
+                f"Selected token: {word!r}    →    encoded message bits: {enc}    "
                 f"({payload['num_bits_encoded']} bit(s))")
-            if payload["hack_applied"]:
-                self.hack_var.set(
-                    "⚠ 50% boundary hack applied: sampling point was forced to "
-                    "75%, so these encoded bits may not match the message bits.")
         else:
-            self.reveal_var.set("Selection hidden — click Next to reveal.")
+            self.reveal_var.set("Selected token hidden — click Next to reveal "
+                                "which token the random value picks.")
+
+    def _render_reveal_decode(self, payload, reveal):
+        # The per-token decoding mask is key-derived (independent of which token
+        # comes next), so it is shown in BOTH phases. On reveal we also show the
+        # full unmasking: the bits read off the token ⊕ mask = message bits.
+        mask = payload.get("mask")
+        if mask is None:
             self.hack_var.set("")
+        elif reveal:
+            masked = "".join(map(str, payload.get("masked_bits", [])))
+            msg = "".join(map(str, payload["recovered_bits"]))
+            applied = "".join(map(str, mask))[:len(masked)]
+            self.hack_var.set(
+                f"unmask: read {masked or '∅'} ⊕ mask {applied or '∅'} = "
+                f"message {msg or '∅'}   "
+                f"[full token mask: {''.join(map(str, mask))}]")
+        else:
+            self.hack_var.set(
+                f"decoding mask (key-derived, token {payload['step']}): "
+                f"{''.join(map(str, mask))}")
+        if reveal:
+            bits = "".join(map(str, payload["recovered_bits"])) or "(none — 0 bits)"
+            extra = " (final token — all remaining bits)" if payload.get("is_final") else ""
+            self.reveal_var.set(
+                f"Next word: {payload.get('selected_word', '?')!r} "
+                f"(rank {payload['selection_idx'] + 1})    →    "
+                f"decoded {len(payload['recovered_bits'])} bit(s){extra}: {bits}")
+        else:
+            self.reveal_var.set("Next word hidden — click Next to reveal which "
+                                "candidate is the next word in the stego-text.")
+
+    def _render_stego(self, payload, reveal):
+        """Decode mode: show the full stego-text with the current word marked."""
+        text = self.stego_text
+        self.bits_text.configure(state="normal")
+        self.bits_text.delete("1.0", "end")
+        self.bits_text.insert("1.0", text)
+        if self.starter_len:
+            self.bits_text.tag_add("done", "1.0", f"1.0+{self.starter_len}c")
+        start = payload.get("done_len", self.starter_len)
+        wlen = payload.get("word_len", 0)
+        if wlen:
+            tag = "just" if reveal else "window"
+            self.bits_text.tag_add(tag, f"1.0+{start}c", f"1.0+{start + wlen}c")
+        self.bits_text.configure(state="disabled")
 
     def _render_bits(self, payload, reveal):
         bits = payload["message_bits"]
@@ -314,8 +436,12 @@ class StegoGui:
             self.phase = 2
             self._render_step(self.current, reveal=True)
             self.next_btn.configure(text="Next ▸  (next step)")
-            self.status_var.set("Selection revealed. Click Next for the "
-                                "following step.")
+            if self.mode == "decode":
+                self.status_var.set("Next word revealed. Click Next for the "
+                                    "following token.")
+            else:
+                self.status_var.set("Selection revealed. Click Next for the "
+                                    "following step.")
         else:
             self.next_btn.configure(state="disabled", text="…")
             self.current = None

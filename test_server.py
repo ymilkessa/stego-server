@@ -11,6 +11,10 @@ import time
 # Server configuration
 SERVER_URL = "http://localhost:3000"
 
+# Shared test message + key (decode must use the same key)
+SECRET_MESSAGE = "Hello World"
+SHARED_KEY = "3f9a8c2b1d4e5f60718293a4b5c6d7e8f0112233445566778899aabbccddeeff"
+
 def test_health():
     """Test the health endpoint"""
     print("Testing health endpoint...")
@@ -29,7 +33,8 @@ def test_encode():
     
     # Test data
     test_data = {
-        "ciphertext": "48656c6c6f20576f726c64",  # "Hello World" in hex
+        "message": SECRET_MESSAGE,
+        "key": SHARED_KEY,
         "start_text": "The weather today is quite nice and ",
         "temp": 1.2,
         "precision": 16,
@@ -66,6 +71,7 @@ def test_decode(stego_text, starter_length):
     test_data = {
         "stego_text": stego_text,
         "starter_length": starter_length,
+        "key": SHARED_KEY,
         "temp": 1.2,
         "precision": 16,
         "topk": 50000
@@ -81,21 +87,19 @@ def test_decode(stego_text, starter_length):
         if response.status_code == 200:
             result = response.json()
             print(f"Success: {result['success']}")
-            print(f"Recovered ciphertext: {result['ciphertext']}")
+            print(f"Recovered message: {result['message']!r}")
+            print(f"Integrity OK: {result.get('integrity_ok')}")
             print(f"Stats: {json.dumps(result['stats'], indent=2)}")
-            
-            # Verify the recovered ciphertext matches the original
-            original_hex = "48656c6c6f20576f726c64"
-            recovered_hex = result['ciphertext']
-            
-            # Compare the beginning (may have extra bits at the end)
-            if recovered_hex.startswith(original_hex):
-                print("✓ Decoding successful - recovered ciphertext matches original!")
+
+            # Verify the recovered plaintext matches the original
+            recovered = result['message']
+            if recovered == SECRET_MESSAGE and result.get('integrity_ok'):
+                print("✓ Decoding successful - recovered message matches original!")
                 return True
             else:
                 print(f"✗ Decoding mismatch:")
-                print(f"  Original:  {original_hex}")
-                print(f"  Recovered: {recovered_hex}")
+                print(f"  Original:  {SECRET_MESSAGE!r}")
+                print(f"  Recovered: {recovered!r} (integrity_ok={result.get('integrity_ok')})")
                 return False
         else:
             print(f"Error: {response.json()}")

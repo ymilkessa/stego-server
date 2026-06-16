@@ -60,7 +60,7 @@ def hex_to_bits(hex_string):
 
 def encode_steganographic(model, tokenizer, message_bits, context_text,
                          temp=1.0, precision=16, topk=50000, verbose=False,
-                         step_hook=None):
+                         step_hook=None, mask_fn=None):
     """
     Encode message bits into text using steganographic arithmetic coding
 
@@ -78,6 +78,12 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
             (candidate tokens, their binary probability ranges, the selection,
             and the bits encoded). The call may block (e.g. the GUI waits for
             the user), which pauses encoding until it returns.
+        mask_fn: Optional callable(token_index: int) -> list[int] returning
+            `precision` mask bits for the given token. Implements Meteor's
+            per-token PRG mask: the value used to sample is the message chunk
+            XOR this mask. Must be the SAME function (same key) used by the
+            decoder. If None, bits are encoded directly (insecure; can stall on
+            a 50%-boundary token).
 
     Returns:
         Generated text tokens (continuation of context)
@@ -109,12 +115,12 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
     
     with torch.no_grad():
         i = 0
-        step_counter = 0
+        token_index = 0
         while i < len(message_bits):
-            # Get message bits for this iteration (no masking - direct encoding)
+            # Get message bits for this iteration
             message_chunk = message_bits[i:i+precision]
             actual_bits = len(message_chunk)
-            
+
             if actual_bits == 0:
                 break  # No more bits to encode
 
@@ -122,8 +128,21 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
             if actual_bits < precision:
                 message_chunk = message_chunk + ([0] * (precision - actual_bits))
 
-            # Snapshot the (unhacked) chunk for visualization before any rewrite
+            # Snapshot the raw message chunk (pre-mask) for visualization
             original_chunk = list(message_chunk)
+
+            # Meteor masking (paper Algorithm 5): XOR a fresh per-token mask into
+            # the value used to sample from the distribution. Drawing a new mask
+            # every token re-randomizes the sampling point even when the previous
+            # step consumed 0 bits, which removes the 50%-boundary stall (no hack
+            # needed) and gives the scheme its one-time-pad security. The PRG is
+            # advanced exactly once per token so the decoder stays in lockstep.
+            if mask_fn is not None:
+                mask_bits = list(mask_fn(token_index))
+                coding_chunk = [b ^ m for b, m in zip(message_chunk, mask_bits)]
+            else:
+                mask_bits = None
+                coding_chunk = message_chunk
 
             # Get model predictions (disable caching for compatibility)
             outputs = model(output_tokens, use_cache=False)
@@ -163,8 +182,8 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
             if len(cum_probs) > 0:
                 cum_probs += max_val - cum_probs[-1]
             
-            # Convert message bits to selection index (no padding)
-            message_idx = bits2int(list(reversed(message_chunk)))
+            # The (masked) value used to sample from the distribution
+            message_idx = bits2int(list(reversed(coding_chunk)))
             
             # Find which cumulative probability bin contains our message index
             selection_idx = 0
@@ -181,34 +200,12 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
             new_int_bottom_bits = list(reversed(int2bits(new_int_bottom, precision)))
             new_int_top_bits = list(reversed(int2bits(new_int_top-1, precision)))
             
-            # Count bits that can be consumed
+            # Count bits that can be consumed. A straddling interval yields 0
+            # here; with masking that is fine -- the next token draws a fresh
+            # mask and re-randomizes, so the message still makes progress. (This
+            # is where the old 50%-boundary hack used to live; it is gone.)
             num_bits_encoded = num_same_from_beg(new_int_bottom_bits, new_int_top_bits)
 
-            hack_applied = False
-            if num_bits_encoded == 0:
-                # Check for 50% boundary conditions (patterns like [1,0,...])
-                if message_chunk[0] == 1 and all(bit == 0 for bit in message_chunk[1:4]):
-                    hack_applied = True
-                    message_idx = max_val * 3 // 4  # 75% point
-                    actual_bits = 1  # Only encode the first bit
-                    message_chunk = [1]  # Only process the first bit
-                    
-                    # Recalculate selection with the hacked message_idx
-                    selection_idx = 0
-                    for j, cum_prob in enumerate(cum_probs):
-                        if cum_prob > message_idx:
-                            selection_idx = j
-                            break
-                    
-                    # Recalculate interval boundaries
-                    new_int_bottom = cum_probs[selection_idx-1].item() if selection_idx > 0 else cur_interval[0]
-                    new_int_top = cum_probs[selection_idx].item()
-                    
-                    # Recalculate bits encoded
-                    new_int_bottom_bits = list(reversed(int2bits(new_int_bottom, precision)))
-                    new_int_top_bits = list(reversed(int2bits(new_int_top-1, precision)))
-                    num_bits_encoded = num_same_from_beg(new_int_bottom_bits, new_int_top_bits)
-            
             # Select the token
             selected_token = indices[selection_idx].unsqueeze(0).unsqueeze(0)
             
@@ -220,11 +217,8 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
                 selected_token_id = indices[selection_idx].item()
                 selected_token_text = tokenizer.decode([selected_token_id])
                 
-                # Get the actual bits that were encoded
-                if num_bits_encoded > 0:
-                    encoded_bits = message_chunk[:num_bits_encoded]
-                else:
-                    encoded_bits = message_chunk
+                # Get the actual message bits that were encoded this step
+                encoded_bits = original_chunk[:num_bits_encoded]
                 
                 # Calculate probability bounds
                 prob_bottom = new_int_bottom / max_val
@@ -248,12 +242,10 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
                 print(f"  Bits remaining: {bits_remaining}/{len(message_bits)} ({bits_remaining/len(message_bits)*100:.1f}% left)")
                 print(f"  Token rank: {selection_idx + 1}/{len(indices)} (prob: {token_prob:.6f})")
                 print(f"  Interval: [{new_int_bottom}, {new_int_top}) = [{prob_bottom:.6f}, {prob_top:.6f}) width: {prob_width:.6f}")
-                if hack_applied:
-                    print(f"  Message index: {message_idx} (50% boundary detected - using 75% point for first bit)")
-                elif actual_bits < precision:
-                    print(f"  Message index: {message_idx} (scaled from {bits2int(list(reversed(message_chunk)))} for {actual_bits} bits)")
+                if mask_bits is not None:
+                    print(f"  Mask: {''.join(map(str, mask_bits))}  ->  masked sampling value (idx): {message_idx}")
                 else:
-                    print(f"  Message index: {message_idx} (from bits: {list(reversed(message_chunk))})")
+                    print(f"  Message index: {message_idx} (from bits: {list(reversed(coding_chunk))})")
                 print(f"  Stego-note: {generated_text_so_far}")
                 print()
             
@@ -261,7 +253,6 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
             # can show the candidate tokens, their binary probability ranges,
             # the selection, and the bits actually consumed.
             if step_hook is not None:
-                step_counter += 1
                 max_display = 60
                 n_cand = len(cum_probs)
                 show = list(range(min(n_cand, max_display)))
@@ -286,15 +277,16 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
                         "prob": probs_temp_sorted[j].item() if j < len(probs_temp_sorted) else 0.0,
                     })
                 step_hook({
-                    "step": step_counter,
+                    "step": token_index + 1,
                     "precision": precision,
                     "message_bits": list(message_bits),
                     "pos": i,
                     "chunk": original_chunk,
+                    "mask": list(mask_bits) if mask_bits is not None else None,
+                    "coding_chunk": list(coding_chunk),
                     "selection_idx": selection_idx,
                     "num_bits_encoded": num_bits_encoded,
                     "encoded_bits": list(message_bits[i:i + num_bits_encoded]),
-                    "hack_applied": hack_applied,
                     "candidates": candidates,
                     "total_candidates": n_cand,
                     "bits_before": i,
@@ -303,6 +295,7 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
                 })
 
             i += num_bits_encoded
+            token_index += 1
 
             # Progress indicator (only if not verbose to avoid clutter)
             if not verbose and i % 50 == 0:

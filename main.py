@@ -20,8 +20,9 @@ import torch
 default_model_id = "meta-llama/Llama-3.2-1B"
 
 # Import the encoding/decoding functions from the raw modules
-from raw_stego_encoder import hex_to_bits, encode_steganographic
-from raw_stego_decoder import bits_to_hex, decode_steganographic
+from raw_stego_encoder import encode_steganographic
+from raw_stego_decoder import decode_steganographic
+from stego_codec import make_mask_fn, text_to_message_bits, message_bits_to_text
 
 # Load environment variables
 load_dotenv()
@@ -111,33 +112,33 @@ def get_cache_status():
 def encode_endpoint():
     """
     Encode endpoint: POST /encode
-    
+
+    The server encrypts the plaintext itself: it derives a per-token PRG mask
+    from `key` (Meteor's PRG.Next) and XOR-masks the message as it samples
+    tokens. Send the plaintext and the shared key, NOT a pre-built ciphertext.
+
     JSON Body:
     {
-        "ciphertext": "5361486a4b31593d",  // hex string
-        "start_text": "Hello world...",    // starting text
+        "message": "Attack at dawn",         // plaintext to hide
+        "key": "3f9a...",                     // shared encryption key (hex string)
+        "start_text": "Hello world...",       // starting text
         "model_id": "meta-llama/Llama-3.2-1B",  // optional, default from server
-        "temp": 1.2,                       // optional, default 1.2
-        "precision": 16,                   // optional, default 16
-        "topk": 50000                      // optional, default 50000
+        "temp": 1.2,                          // optional, default 1.2
+        "precision": 16,                      // optional, default 16
+        "topk": 50000                         // optional, default 50000
     }
-    
+
     Response:
     {
         "success": true,
         "stego_text": "Hello world companies like...",
-        "starter_length": 25,              // length of starting text in characters
-        "config": {
-            "model_id": "meta-llama/Llama-3.2-1B",
-            "temp": 1.2,
-            "precision": 16,
-            "topk": 50000
-        },
+        "starter_length": 25,                 // length of starting text in characters
+        "config": { "model_id": ..., "temp": 1.2, "precision": 16, "topk": 50000 },
         "stats": {
-            "input_hex_length": 16,
-            "input_bytes": 8,
-            "message_bits": 64,
-            "output_tokens": 25
+            "message_chars": 14,
+            "message_bytes": 14,
+            "message_bits": 160,              // includes 6-byte commit+length frame
+            "output_tokens": 42
         }
     }
     """
@@ -146,29 +147,31 @@ def encode_endpoint():
         data = request.get_json()
         if not data:
             return jsonify({"success": False, "error": "No JSON data provided"}), 400
-        
-        print(f"Data: {data}")
-        
+
         # Extract required parameters
-        ciphertext_hex = data.get('ciphertext')
+        message = data.get('message')
+        key = data.get('key')
         start_text = data.get('start_text')
-        
-        if not ciphertext_hex:
-            return jsonify({"success": False, "error": "Missing required parameter: ciphertext"}), 400
+
+        if message is None:
+            return jsonify({"success": False, "error": "Missing required parameter: message"}), 400
+        if not key:
+            return jsonify({"success": False, "error": "Missing required parameter: key"}), 400
         if not start_text:
             return jsonify({"success": False, "error": "Missing required parameter: start_text"}), 400
-        
+
         # Extract optional parameters
         model_id = data.get('model_id', default_model_id)
         temp = data.get('temp', 1.2)
         precision = data.get('precision', 16)
         topk = data.get('topk', 50000)
-        
+
         # Get model from cache (loads if not cached)
         model, tokenizer = get_model(model_id)
-        
-        # Convert hex to bits
-        message_bits = hex_to_bits(ciphertext_hex)
+
+        # Frame the plaintext (commit + length + bytes) and build the PRG mask.
+        message_bits = text_to_message_bits(message)
+        mask_fn = make_mask_fn(key, precision)
 
         # When the GUI is attached, drive it step-by-step (one encode at a time).
         gui = GUI_BRIDGE
@@ -177,7 +180,8 @@ def encode_endpoint():
             if not gui.session_lock.acquire(blocking=False):
                 return jsonify({"success": False,
                                 "error": "GUI is busy visualizing another encode"}), 409
-            gui.begin_session({"ciphertext": ciphertext_hex, "start_text": start_text})
+            gui.begin_session({"mode": "encode", "message": message,
+                               "start_text": start_text})
             step_hook = gui.hook
 
         try:
@@ -186,7 +190,7 @@ def encode_endpoint():
             generated_tokens = encode_steganographic(
                 model, tokenizer, message_bits, start_text,
                 temp=temp, precision=precision, topk=topk, verbose=verbose,
-                step_hook=step_hook
+                step_hook=step_hook, mask_fn=mask_fn
             )
             print(f"Just finished encoding steganographic text...")
 
@@ -199,7 +203,7 @@ def encode_endpoint():
         finally:
             if gui is not None:
                 gui.session_lock.release()
-        
+
         # Prepare response
         response = {
             "success": True,
@@ -212,17 +216,17 @@ def encode_endpoint():
                 "topk": topk
             },
             "stats": {
-                "input_hex_length": len(ciphertext_hex),
-                "input_bytes": len(ciphertext_hex) // 2,
+                "message_chars": len(message),
+                "message_bytes": len(message.encode('utf-8')),
                 "message_bits": len(message_bits),
                 "output_tokens": generated_tokens.shape[1]
             }
         }
 
         print(f"Response: {response}")
-        
+
         return jsonify(response)
-        
+
     except Exception as e:
         error_msg = f"Encoding error: {str(e)}"
         if verbose:
@@ -233,34 +237,28 @@ def encode_endpoint():
 def decode_endpoint():
     """
     Decode endpoint: POST /decode
-    
+
+    Recovers the plaintext directly. Pass the SAME `key` used to encode; the
+    server regenerates the per-token mask and unmasks the recovered bits.
+
     JSON Body:
     {
         "stego_text": "Hello world companies like...",  // full steganographic text
         "starter_length": 25,                            // number of characters in starting text
+        "key": "3f9a...",                                // same shared key used to encode
         "model_id": "meta-llama/Llama-3.2-1B",  // optional, default from server
         "temp": 1.2,                                     // optional, default 1.2
         "precision": 16,                                 // optional, default 16
         "topk": 50000                                    // optional, default 50000
     }
-    
+
     Response:
     {
         "success": true,
-        "ciphertext": "5361486a4b31593d",  // recovered hex string
-        "config": {
-            "model_id": "meta-llama/Llama-3.2-1B",
-            "temp": 1.2,
-            "precision": 16,
-            "topk": 50000
-        },
-        "stats": {
-            "input_length": 245,
-            "generated_tokens": 25,
-            "recovered_bits": 64,
-            "output_hex_length": 16,
-            "output_bytes": 8
-        }
+        "message": "Attack at dawn",   // recovered plaintext
+        "integrity_ok": true,          // false => wrong key or corrupted stegotext
+        "config": { "model_id": ..., "temp": 1.2, "precision": 16, "topk": 50000 },
+        "stats": { "input_length": 245, "generated_tokens": 42, "recovered_bits": 320 }
     }
     """
     try:
@@ -268,50 +266,79 @@ def decode_endpoint():
         data = request.get_json()
         if not data:
             return jsonify({"success": False, "error": "No JSON data provided"}), 400
-        
+
         # Extract required parameters
         stego_text = data.get('stego_text')
         starter_length = data.get('starter_length')
-        
+        key = data.get('key')
+
         if not stego_text:
             return jsonify({"success": False, "error": "Missing required parameter: stego_text"}), 400
         if starter_length is None:
             return jsonify({"success": False, "error": "Missing required parameter: starter_length"}), 400
-        
+        if not key:
+            return jsonify({"success": False, "error": "Missing required parameter: key"}), 400
+
         # Extract optional parameters
         model_id = data.get('model_id', default_model_id)
         temp = data.get('temp', 1.2)
         precision = data.get('precision', 16)
         topk = data.get('topk', 50000)
-        
+
         # Validate starter_length
         if not isinstance(starter_length, int) or starter_length < 1:
             return jsonify({"success": False, "error": "starter_length must be a positive integer"}), 400
         if starter_length >= len(stego_text):
             return jsonify({"success": False, "error": "starter_length must be less than the total stego_text length"}), 400
-        
+
         # Extract start_text using the provided starter_length
         start_text = stego_text[:starter_length]
-        
+
         # Get model from cache (loads if not cached)
         model, tokenizer = get_model(model_id)
-        
-        # Decode steganographically using imported function
-        recovered_bits = decode_steganographic(
-            model, tokenizer, stego_text, start_text,
-            temp=temp, precision=precision, topk=topk, verbose=verbose
-        )
-        
-        if not recovered_bits:
-            return jsonify({"success": False, "error": "No bits recovered from steganographic text"}), 400
-        
-        # Convert bits back to hex
-        recovered_hex = bits_to_hex(recovered_bits)
-        
+
+        # Decode steganographically, undoing the per-token mask with the key.
+        mask_fn = make_mask_fn(key, precision)
+
+        # When the GUI is attached, drive it step-by-step (one request at a time,
+        # shared with /encode via the same session lock).
+        gui = GUI_BRIDGE
+        step_hook = None
+        if gui is not None:
+            if not gui.session_lock.acquire(blocking=False):
+                return jsonify({"success": False,
+                                "error": "GUI is busy visualizing another request"}), 409
+            gui.begin_session({"mode": "decode", "stego_text": stego_text,
+                               "start_text": start_text})
+            step_hook = gui.hook
+
+        try:
+            recovered_bits = decode_steganographic(
+                model, tokenizer, stego_text, start_text,
+                temp=temp, precision=precision, topk=topk, verbose=verbose,
+                mask_fn=mask_fn, step_hook=step_hook
+            )
+
+            if not recovered_bits:
+                if gui is not None:
+                    gui.end_session("(no bits recovered)")
+                return jsonify({"success": False, "error": "No bits recovered from steganographic text"}), 400
+
+            # Parse the framed plaintext back out of the recovered bits
+            message, integrity_ok = message_bits_to_text(recovered_bits)
+
+            if gui is not None:
+                tag = "" if integrity_ok else "  [integrity check FAILED — wrong key?]"
+                gui.end_session(f"{message}{tag}")
+        finally:
+            if gui is not None:
+                gui.session_lock.release()
+
         # Prepare response
         response = {
             "success": True,
-            "ciphertext": recovered_hex,
+            "message": message,
+            "integrity_ok": integrity_ok,
             "config": {
                 "model_id": model_id,
                 "temp": temp,
@@ -321,12 +348,10 @@ def decode_endpoint():
             "stats": {
                 "input_length": len(stego_text),
                 "generated_tokens": len(stego_text) - len(start_text),  # Approximate
-                "recovered_bits": len(recovered_bits),
-                "output_hex_length": len(recovered_hex),
-                "output_bytes": len(recovered_hex) // 2
+                "recovered_bits": len(recovered_bits)
             }
         }
-        
+
         return jsonify(response)
         
     except Exception as e:
@@ -402,8 +427,8 @@ def root():
         "default_model_id": default_model_id,
         "cache_info": get_cache_status(),
         "endpoints": {
-            "POST /encode": "Encode hexadecimal ciphertext into steganographic text",
-            "POST /decode": "Decode steganographic text back to hexadecimal ciphertext",
+            "POST /encode": "Encode a plaintext message (+ key) into steganographic text",
+            "POST /decode": "Decode steganographic text (+ key) back to the plaintext message",
             "GET /health": "Health check endpoint",
             "GET /cache": "Get cache status",
             "POST /cache/clear": "Clear model cache",
@@ -413,7 +438,8 @@ def root():
              "url": "/encode",
              "method": "POST",
              "body": {
-                 "ciphertext": "5361486a4b31593d",
+                 "message": "Attack at dawn",
+                 "key": "3f9a8c2b1d4e5f60718293a4b5c6d7e8",
                  "start_text": "Hello world",
                  "model_id": default_model_id,
                  "temp": 1.2,
@@ -422,11 +448,12 @@ def root():
              }
          },
          "example_decode": {
-             "url": "/decode", 
+             "url": "/decode",
              "method": "POST",
              "body": {
                  "stego_text": "Hello world companies like...",
                  "starter_length": 25,
+                 "key": "3f9a8c2b1d4e5f60718293a4b5c6d7e8",
                  "model_id": default_model_id,
                  "temp": 1.2,
                  "precision": 16,

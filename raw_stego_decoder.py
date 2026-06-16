@@ -55,11 +55,12 @@ def bits_to_hex(bits):
     # Always return as hex string (to match encoder input format)
     return ''.join(f'{b:02x}' for b in bytes_data)
 
-def decode_steganographic(model, tokenizer, stego_text, context_text, 
-                         temp=1.0, precision=16, topk=50000, verbose=False):
+def decode_steganographic(model, tokenizer, stego_text, context_text,
+                         temp=1.0, precision=16, topk=50000, verbose=False,
+                         mask_fn=None, step_hook=None):
     """
     Decode message bits from steganographic text using arithmetic coding
-    
+
     Args:
         model: The language model
         tokenizer: The tokenizer
@@ -69,7 +70,17 @@ def decode_steganographic(model, tokenizer, stego_text, context_text,
         precision: Precision for arithmetic coding (same as used in encoding)
         topk: Top-k cutoff for vocabulary (same as used in encoding)
         verbose: Show detailed token decoding information
-    
+        mask_fn: Optional callable(token_index: int) -> list[int] returning
+            `precision` mask bits. Must be the SAME function (same key) used by
+            the encoder. The recovered prefix bits of each token are XORed with
+            this mask to undo Meteor's masking. If None, bits are read directly.
+        step_hook: Optional callable(step_payload: dict). Invoked once per
+            decoded token with everything needed to visualize that step: the
+            candidate tokens with their binary probability ranges, which
+            candidate matches the next word in the stego-text, and how many
+            bits that token choice recovers. The call may block (e.g. the GUI
+            waits for the user), which pauses decoding until it returns.
+
     Returns:
         List of decoded message bits
     """
@@ -188,15 +199,25 @@ def decode_steganographic(model, tokenizer, stego_text, context_text,
             # Count bits that were encoded
             num_bits_encoded = num_same_from_beg(new_int_bottom_bits, new_int_top_bits)
             
-            # Extract the bits that were encoded (no unmasking - direct decoding)
+            # Extract the (masked) bits that were encoded by this token.
             if token_idx == generated_tokens.shape[1] - 1:  # Last token
-                # For the last token, we need to determine how many bits were actually encoded
-                # This is tricky without knowing the exact original bit count
-                # For now, use all bottom bits (this may include some extra bits)
+                # For the last token we cannot know exactly how many bits were
+                # encoded, so emit all bottom bits. Any surplus past the true
+                # message length is ignored by the length-prefixed framing.
                 recovered_bits = new_int_bottom_bits
             else:
-                # For other tokens, use only the fixed bits
+                # For other tokens, use only the fixed prefix bits
                 recovered_bits = new_int_top_bits[:num_bits_encoded]
+
+            # Undo Meteor's per-token mask (XOR). PRG.Next is advanced once per
+            # token (token_idx), matching the encoder, so the streams stay in
+            # lockstep even when a token carried 0 bits.
+            mask_bits = None
+            masked_bits = list(recovered_bits)  # bits as read, before unmasking
+            if mask_fn is not None:
+                mask_bits = list(mask_fn(token_idx))
+                recovered_bits = [b ^ m for b, m in
+                                  zip(recovered_bits, mask_bits[:len(recovered_bits)])]
             
             # Verbose output for this token decoding
             if verbose:
@@ -221,6 +242,59 @@ def decode_steganographic(model, tokenizer, stego_text, context_text,
                 print(f"  Bits recovered: {len(recovered_bits)} (total so far: {len(message_bits) + len(recovered_bits)})")
                 print()
             
+            # GUI/step hook: surface everything about this decode step so a
+            # visualizer can show the candidate tokens, their binary probability
+            # ranges, which candidate is the actual next word in the stego-text,
+            # and how many bits that choice recovers.
+            if step_hook is not None:
+                is_final = token_idx == generated_tokens.shape[1] - 1
+                word = tokenizer.decode([actual_token])
+                prefix_text = context_text
+                if token_idx > 0:
+                    prefix_text = context_text + tokenizer.decode(
+                        generated_tokens[0, :token_idx])
+                max_display = 60
+                n_cand = len(cum_probs)
+                show = list(range(min(n_cand, max_display)))
+                if selection_idx not in show:
+                    show.append(selection_idx)
+                candidates = []
+                for j in show:
+                    lo = cum_probs[j - 1].item() if j > 0 else cur_interval[0]
+                    hi = cum_probs[j].item()
+                    lo_bits = list(reversed(int2bits(lo, precision)))
+                    hi_bits = list(reversed(int2bits(hi - 1, precision)))
+                    shared = num_same_from_beg(lo_bits, hi_bits)
+                    candidates.append({
+                        "rank": j,
+                        "word": tokenizer.decode([indices[j].item()]),
+                        "lo": lo,
+                        "hi": hi,
+                        "lo_bits": "".join(map(str, lo_bits)),
+                        "hi_bits": "".join(map(str, hi_bits)),
+                        "fixes": shared,
+                        "prefix": "".join(map(str, hi_bits[:shared])),
+                        "prob": probs_temp_sorted[j].item() if j < len(probs_temp_sorted) else 0.0,
+                    })
+                step_hook({
+                    "mode": "decode",
+                    "step": token_idx + 1,
+                    "precision": precision,
+                    "selection_idx": selection_idx,
+                    "selected_word": word,
+                    "num_bits_encoded": len(recovered_bits),
+                    "recovered_bits": list(recovered_bits),
+                    "mask": list(mask_bits) if mask_bits is not None else None,
+                    "masked_bits": masked_bits,
+                    "is_final": is_final,
+                    "candidates": candidates,
+                    "total_candidates": n_cand,
+                    "bits_before": len(message_bits),
+                    "bits_after": len(message_bits) + len(recovered_bits),
+                    "done_len": len(prefix_text),
+                    "word_len": len(word),
+                })
+
             # Add the recovered bits to our message
             message_bits.extend(recovered_bits)
             
