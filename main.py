@@ -22,7 +22,8 @@ default_model_id = "meta-llama/Llama-3.2-1B"
 # Import the encoding/decoding functions from the raw modules
 from raw_stego_encoder import encode_steganographic
 from raw_stego_decoder import decode_steganographic
-from stego_codec import make_mask_fn, text_to_message_bits, message_bits_to_text
+from stego_codec import (make_mask_fn, text_to_message_bits,
+                         message_bits_to_text, frame_is_complete)
 
 # Load environment variables
 load_dotenv()
@@ -190,7 +191,7 @@ def encode_endpoint():
             generated_tokens = encode_steganographic(
                 model, tokenizer, message_bits, start_text,
                 temp=temp, precision=precision, topk=topk, verbose=verbose,
-                step_hook=step_hook, mask_fn=mask_fn
+                step_hook=step_hook, mask_fn=mask_fn, complete_text=True
             )
             print(f"Just finished encoding steganographic text...")
 
@@ -316,7 +317,7 @@ def decode_endpoint():
             recovered_bits = decode_steganographic(
                 model, tokenizer, stego_text, start_text,
                 temp=temp, precision=precision, topk=topk, verbose=verbose,
-                mask_fn=mask_fn, step_hook=step_hook
+                mask_fn=mask_fn, step_hook=step_hook, done_fn=frame_is_complete
             )
 
             if not recovered_bits:

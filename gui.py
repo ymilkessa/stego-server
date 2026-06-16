@@ -282,9 +282,14 @@ class StegoGui:
         else:
             self.next_btn.configure(state="normal",
                                     text="Next ▸  (reveal selection)")
-            self.status_var.set(
-                f"Step {payload['step']}: {payload['total_candidates']} candidate "
-                f"token(s). Inspect the ranges + random value, then click Next.")
+            if payload.get("cover"):
+                self.status_var.set(
+                    f"Step {payload['step']} (cover): message fully encoded — "
+                    f"completing the essay. Click Next, or Finish to fast-forward.")
+            else:
+                self.status_var.set(
+                    f"Step {payload['step']}: {payload['total_candidates']} candidate "
+                    f"token(s). Inspect the ranges + random value, then click Next.")
 
     def _handle_end(self, final_text):
         self._clear_step()
@@ -324,6 +329,25 @@ class StegoGui:
         self._set_output(f"Decoded bits so far ({len(bits)}):\n{grouped}")
 
     def _render_reveal_encode(self, payload, reveal):
+        # Cover continuation: the message is fully encoded and we are now
+        # sampling honestly (fresh random coins) to finish the essay. These
+        # tokens carry no message bits and the decoder ignores them.
+        if payload.get("cover"):
+            self.hack_var.set(
+                "cover continuation — message done; sampling honestly "
+                f"(random coins: {''.join(map(str, payload['coding_chunk']))}). "
+                "No message bits encoded here.")
+            if reveal:
+                sel = payload["candidates_by_rank"].get(payload["selection_idx"])
+                word = sel["word"] if sel else "?"
+                self.reveal_var.set(
+                    f"Cover token: {word!r}    →    completes the essay "
+                    f"(0 message bits)")
+            else:
+                self.reveal_var.set(
+                    "Cover token hidden — message already fully encoded; click "
+                    "Next to reveal the essay-completing word.")
+            return
         # The random value (message ⊕ per-token mask) drives the selection, so
         # it is shown in BOTH phases — only the resulting token is hidden until
         # the user clicks Next.

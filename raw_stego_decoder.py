@@ -57,7 +57,7 @@ def bits_to_hex(bits):
 
 def decode_steganographic(model, tokenizer, stego_text, context_text,
                          temp=1.0, precision=16, topk=50000, verbose=False,
-                         mask_fn=None, step_hook=None):
+                         mask_fn=None, step_hook=None, done_fn=None):
     """
     Decode message bits from steganographic text using arithmetic coding
 
@@ -80,6 +80,13 @@ def decode_steganographic(model, tokenizer, stego_text, context_text,
             candidate matches the next word in the stego-text, and how many
             bits that token choice recovers. The call may block (e.g. the GUI
             waits for the user), which pauses decoding until it returns.
+        done_fn: Optional callable(message_bits: list[int]) -> bool. Checked
+            after each token; when it returns True the decoder stops, having
+            recovered the whole message. The server passes
+            `stego_codec.frame_is_complete`, so decoding halts the instant the
+            length-prefixed frame is satisfied and never reads into the
+            cover-text continuation that complete_text encoding appends. If
+            None, every token is decoded (legacy behavior).
 
     Returns:
         List of decoded message bits
@@ -297,7 +304,19 @@ def decode_steganographic(model, tokenizer, stego_text, context_text,
 
             # Add the recovered bits to our message
             message_bits.extend(recovered_bits)
-            
+
+            # Stop as soon as the framed message is complete. The length prefix
+            # tells us exactly where the message ends, so we ignore the rest of
+            # the stego-text (the cover-text continuation). This is what lets a
+            # complete essay be decoded without reading beyond the message.
+            if done_fn is not None and done_fn(message_bits):
+                if verbose:
+                    print(f"done_fn satisfied after token {token_idx + 1}; "
+                          f"message complete at {len(message_bits)} bits. "
+                          f"Skipping the remaining "
+                          f"{generated_tokens.shape[1] - token_idx - 1} cover token(s).")
+                break
+
             # Progress indicator (only if not verbose to avoid clutter)
             if not verbose and (token_idx + 1) % 10 == 0:
                 print(f"Decoded token {token_idx + 1}/{generated_tokens.shape[1]}, recovered {len(message_bits)} bits so far...")

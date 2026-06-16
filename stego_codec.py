@@ -73,6 +73,29 @@ def text_to_message_bits(text: str):
     return bits
 
 
+def frame_bit_length(bits):
+    """Total number of bits the self-describing frame occupies, once its 6-byte
+    header (4 commit + 2 length) has been recovered.
+
+    Layout: [4 commit][2 length N][N payload] -> 48 + 8*N bits. Returns None
+    while fewer than 48 bits are available (length not yet known). This is the
+    in-band signal Meteor lacks: it lets the decoder know exactly where the
+    message ends so it can ignore any cover-text continuation that follows."""
+    if len(bits) < 48:
+        return None
+    n = (bits2int(bits[32:40]) << 8) | bits2int(bits[40:48])
+    return 48 + 8 * n
+
+
+def frame_is_complete(bits):
+    """True once enough bits have been recovered to cover the entire framed
+    message (header + declared payload). Passed to the decoder as `done_fn` so
+    it stops reading the moment the message ends -- never decoding into the
+    cover-text continuation appended by complete_text encoding."""
+    target = frame_bit_length(bits)
+    return target is not None and len(bits) >= target
+
+
 def message_bits_to_text(bits):
     """Inverse of `text_to_message_bits`.
 

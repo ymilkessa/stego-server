@@ -5,3 +5,5 @@ CLAUDE.md
 EDGE_CASES.md
 meteor_p_1-15.tex
 BOUNDARY_ISSUE.md
+_manuals
+__pycache__/
