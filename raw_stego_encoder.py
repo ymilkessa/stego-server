@@ -61,16 +61,34 @@ def hex_to_bits(hex_string):
 
 
 def _ends_sentence(piece):
-    """Heuristic: does this decoded token text end a sentence? Used to stop the
-    cover-text continuation at a natural boundary so the essay reads complete."""
+    """Heuristic: does this decoded token text end a sentence? Only used as a
+    fallback to trim a clean ending if the model never emits EOS before the
+    safety cap -- the primary completion signal is the model's own EOS token."""
     s = piece.rstrip(" \t\"')]}>”’")
     return s.endswith((".", "!", "?", "\n"))
+
+
+def _eos_token_ids(tokenizer, model):
+    """Collect every token id that means 'generation is complete'. This is the
+    standard way a generative model signals it is done (exactly what
+    transformers' model.generate() stops on). Llama-3 Instruct in particular has
+    several terminators (e.g. <|end_of_text|> and <|eot_id|>), so we gather them
+    from both the tokenizer and the model's generation_config."""
+    ids = set()
+    for src in (getattr(tokenizer, "eos_token_id", None),
+                getattr(getattr(model, "generation_config", None),
+                        "eos_token_id", None)):
+        if isinstance(src, int):
+            ids.add(src)
+        elif isinstance(src, (list, tuple, set)):
+            ids.update(int(x) for x in src if x is not None)
+    return ids
 
 
 def encode_steganographic(model, tokenizer, message_bits, context_text,
                          temp=1.0, precision=16, topk=50000, verbose=False,
                          step_hook=None, mask_fn=None, complete_text=False,
-                         min_cover_tokens=16, max_cover_tokens=400):
+                         max_cover_tokens=512):
     """
     Encode message bits into text using steganographic arithmetic coding
 
@@ -97,16 +115,21 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
         complete_text: When True, keep sampling cover tokens AFTER the message
             has been fully encoded, so the output reads like a complete essay
             instead of stopping mid-thought. Meteor's Algorithm 5 stops the
-            instant `n >= |m|`; this flag adds an honest-sampling continuation.
-            The continuation carries no message bits -- each cover token is
-            sampled from fresh random coins, i.e. exactly an ordinary draw from
-            the model -- so it stays indistinguishable from normal output and
-            the decoder ignores it (the length-prefixed frame marks where the
-            message ends). See STEGO_TEXT_COMPLETION.md.
-        min_cover_tokens: Minimum number of cover tokens to add before a
-            sentence-boundary stop is allowed (only used when complete_text).
-        max_cover_tokens: Hard cap on cover tokens, bounding runtime even if no
-            EOS / sentence boundary is reached (only used when complete_text).
+            instant `n >= |m|`; this flag adds an honest-sampling continuation
+            that runs until the model signals completion by emitting its EOS
+            token (the standard generation-complete signal, exactly what
+            transformers' model.generate() stops on). The continuation carries
+            no message bits -- each cover token is sampled from fresh random
+            coins, i.e. exactly an ordinary draw from the model -- so it stays
+            indistinguishable from normal output and the decoder ignores it (the
+            length-prefixed frame marks where the message ends). See
+            STEGO_TEXT_COMPLETION.md.
+        max_cover_tokens: Safety cap on cover tokens, bounding runtime if the
+            model never emits EOS (common for non-instruct base models, which
+            are trained to continue text indefinitely). If the cap is hit, the
+            continuation is trimmed back to the last sentence boundary so the
+            essay still ends cleanly rather than mid-word. Only used when
+            complete_text.
 
     Returns:
         Generated text tokens (continuation of context)
@@ -123,12 +146,13 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
     threshold = 1 / max_val
 
     output_tokens = context_tokens.clone()
-    eos_id = getattr(tokenizer, "eos_token_id", None)
+    eos_ids = _eos_token_ids(tokenizer, model)
 
     print(f"Encoding {len(message_bits)} bits into steganographic text...")
     if complete_text:
-        print("complete_text=ON: will continue sampling cover text after the "
-              "message to finish the essay.")
+        print(f"complete_text=ON: continuing until the model emits EOS "
+              f"{sorted(eos_ids) or '(none configured)'} "
+              f"(safety cap {max_cover_tokens} cover tokens).")
 
     if verbose:
         print("\n" + "="*80)
@@ -197,6 +221,8 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
         i = 0                 # message bits consumed so far
         token_index = 0       # token counter (drives the PRG mask)
         cover_tokens = 0      # cover tokens added after the message
+        last_boundary_len = None  # output length at the last sentence end (cover)
+        hit_cover_cap = False     # True if cover stopped on the safety cap
         while True:
             in_message = i < len(message_bits)
 
@@ -244,10 +270,12 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
 
             sel_id = indices[selection_idx].item()
 
-            # End the essay cleanly if the model emits EOS during cover sampling.
-            if not in_message and eos_id is not None and sel_id == eos_id:
+            # The model signals it has finished by emitting EOS. This is the
+            # standard completion criterion, so during cover sampling we treat it
+            # as the essay being done and stop (without appending the EOS token).
+            if not in_message and sel_id in eos_ids:
                 if verbose:
-                    print("Cover: EOS sampled -> ending essay.\n")
+                    print("Cover: model emitted EOS -> essay complete.\n")
                 break
 
             # Calculate interval boundaries and the consumed prefix length
@@ -340,13 +368,26 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
                     print(f"Encoded {i}/{len(message_bits)} bits...")
             else:
                 cover_tokens += 1
+                # Remember the last clean sentence end, so that if we hit the
+                # safety cap (model never emitted EOS) we can trim back to it.
+                if _ends_sentence(tokenizer.decode([sel_id])):
+                    last_boundary_len = output_tokens.shape[1]
                 if cover_tokens >= max_cover_tokens:
                     if verbose:
-                        print(f"Cover: reached max_cover_tokens={max_cover_tokens}; stopping.\n")
+                        print(f"Cover: reached safety cap "
+                              f"max_cover_tokens={max_cover_tokens} without EOS; "
+                              f"stopping.\n")
+                    hit_cover_cap = True
                     break
-                if (cover_tokens >= min_cover_tokens
-                        and _ends_sentence(tokenizer.decode([sel_id]))):
-                    break
+
+    # If the model never emitted EOS and we stopped on the safety cap, trim the
+    # dangling partial sentence so the essay ends on a clean boundary.
+    if hit_cover_cap and last_boundary_len is not None:
+        if verbose:
+            trimmed = output_tokens.shape[1] - last_boundary_len
+            print(f"Trimming {trimmed} trailing token(s) back to the last "
+                  f"sentence boundary for a clean ending.\n")
+        output_tokens = output_tokens[:, :last_boundary_len]
 
     # Return only the generated tokens (excluding context)
     generated_tokens = output_tokens[:, context_tokens.shape[1]:]
