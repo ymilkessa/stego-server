@@ -23,9 +23,20 @@ def bits2int(bits):
     return res
 
 def int2bits(inp, num_bits):
-    """Convert integer to bit array (LSB first)"""
+    """Convert integer to bit array (LSB first), exactly num_bits long.
+
+    The input is taken modulo 2**num_bits so the result is ALWAYS exactly
+    num_bits bits. This matters at the arithmetic-coding interval boundaries: a
+    degenerate (zero-width) top bin can have a bound equal to 2**num_bits (=
+    max_val, which is just out of the num_bits range), and a bottom bound can
+    momentarily be -1. Without the mask, str-formatting those yields num_bits+1
+    chars (or a stray '-'), which breaks the equal-length invariant that
+    num_same_from_beg relies on. Masking wraps them back into range -- the
+    correct precision-bit register semantics -- and leaves every in-range value
+    [0, 2**num_bits) untouched."""
     if num_bits == 0:
         return []
+    inp &= (1 << num_bits) - 1
     strlist = ('{0:0%db}' % num_bits).format(inp)
     return [int(strval) for strval in reversed(strlist)]
 
@@ -88,7 +99,7 @@ def _eos_token_ids(tokenizer, model):
 def encode_steganographic(model, tokenizer, message_bits, context_text,
                          temp=1.0, precision=16, topk=50000, verbose=False,
                          step_hook=None, mask_fn=None, complete_text=False,
-                         max_cover_tokens=512):
+                         max_cover_tokens=512, context_prefix=""):
     """
     Encode message bits into text using steganographic arithmetic coding
 
@@ -130,12 +141,20 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
             continuation is trimmed back to the last sentence boundary so the
             essay still ends cleanly rather than mid-word. Only used when
             complete_text.
+        context_prefix: Optional internal steering prompt prepended to the
+            model's context ONLY (e.g. an instruction nudging the model to wrap
+            up and emit EOS). It conditions generation but is NOT part of the
+            returned tokens -- those exclude the entire context -- so the caller
+            never sees it in the output. The decoder must be given the SAME
+            prefix so it conditions on identical context.
 
     Returns:
-        Generated text tokens (continuation of context)
+        Generated text tokens (continuation of context, excluding context_prefix)
     """
-    # Tokenize context
-    context_tokens = tokenizer.encode(context_text, return_tensors="pt")
+    # Tokenize context. The internal context_prefix (if any) conditions the model
+    # but is part of the context, so the returned generated tokens exclude it.
+    context_tokens = tokenizer.encode(context_prefix + context_text,
+                                      return_tensors="pt")
     context_tokens = context_tokens.to(model.device)
 
     # Limit context length to avoid memory issues
@@ -223,12 +242,16 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
         cover_tokens = 0      # cover tokens added after the message
         last_boundary_len = None  # output length at the last sentence end (cover)
         hit_cover_cap = False     # True if cover stopped on the safety cap
+        termination_reason = None  # why the encoding loop stopped (for logging)
         while True:
             in_message = i < len(message_bits)
 
             # Once the message is fully encoded, either stop (Meteor's default)
             # or keep going to complete the essay with honest cover sampling.
             if not in_message and not complete_text:
+                termination_reason = (
+                    f"message fully encoded ({i}/{len(message_bits)} bits); "
+                    f"complete_text=False so no cover text was added")
                 break
 
             if in_message:
@@ -261,6 +284,22 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
 
             cum_probs, indices, probs_sorted = build_distribution()
 
+            # Guard: a degenerate context (often right after the model has been
+            # fed an EOS token while still mid-message) can leave no usable
+            # candidates after the probability cutoff. Selecting from an empty
+            # distribution would crash with an opaque IndexError, so fail loudly
+            # with the full loop state instead.
+            if len(cum_probs) == 0 or len(indices) == 0:
+                phase = "message" if in_message else "cover"
+                print(f"[encode] ERROR: empty token distribution at token_index "
+                      f"{token_index} (phase={phase}, {i}/{len(message_bits)} "
+                      f"message bits encoded, {cover_tokens} cover tokens). The "
+                      f"model returned no candidates above the cutoff -- usually "
+                      f"the aftermath of an EOS/degenerate context. Aborting.")
+                raise RuntimeError(
+                    f"empty token distribution during encoding at token_index "
+                    f"{token_index} ({i}/{len(message_bits)} message bits done)")
+
             # Find which cumulative-probability bin contains the sampling value
             selection_idx = 0
             for j in range(len(cum_probs)):
@@ -270,10 +309,25 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
 
             sel_id = indices[selection_idx].item()
 
+            # Diagnostic: the model wanting to STOP (EOS) while we are still
+            # embedding the message is a red flag. We don't treat it as a stop
+            # here (the message isn't done), but appending an EOS token feeds the
+            # model a "text ended" signal that can derail the next step's
+            # distribution -- a likely cause of a mid-message crash or garbage.
+            if in_message and sel_id in eos_ids:
+                print(f"[encode] WARNING: model selected an EOS token (id "
+                      f"{sel_id}) at token_index {token_index} while still "
+                      f"encoding the message ({i}/{len(message_bits)} bits done). "
+                      f"The message is NOT complete; continuing, but this often "
+                      f"precedes a degenerate next distribution.")
+
             # The model signals it has finished by emitting EOS. This is the
             # standard completion criterion, so during cover sampling we treat it
             # as the essay being done and stop (without appending the EOS token).
             if not in_message and sel_id in eos_ids:
+                termination_reason = (
+                    f"model emitted EOS (id {sel_id}) during cover text after "
+                    f"{cover_tokens} cover token(s)")
                 if verbose:
                     print("Cover: model emitted EOS -> essay complete.\n")
                 break
@@ -373,12 +427,29 @@ def encode_steganographic(model, tokenizer, message_bits, context_text,
                 if _ends_sentence(tokenizer.decode([sel_id])):
                     last_boundary_len = output_tokens.shape[1]
                 if cover_tokens >= max_cover_tokens:
+                    termination_reason = (
+                        f"hit cover-text safety cap "
+                        f"(max_cover_tokens={max_cover_tokens}) without the model "
+                        f"emitting EOS")
                     if verbose:
                         print(f"Cover: reached safety cap "
                               f"max_cover_tokens={max_cover_tokens} without EOS; "
                               f"stopping.\n")
                     hit_cover_cap = True
                     break
+
+    # Log why the encoding loop stopped, plus the final counts. This always
+    # prints (a single line at a boundary, not per-token) so a premature stop --
+    # e.g. an early EOS, or stopping with bits still unencoded -- is obvious
+    # without enabling verbose.
+    tokens_generated = output_tokens.shape[1] - context_tokens.shape[1]
+    print(f"[encode] encoding loop terminated: {termination_reason or 'unknown'}")
+    print(f"[encode]   message bits encoded: {i}/{len(message_bits)}")
+    print(f"[encode]   cover tokens appended: {cover_tokens}")
+    print(f"[encode]   tokens generated: {tokens_generated}")
+    if i < len(message_bits):
+        print(f"[encode]   WARNING: stopped with {len(message_bits) - i} "
+              f"message bit(s) NOT yet encoded -- the message is incomplete!")
 
     # If the model never emitted EOS and we stopped on the safety cap, trim the
     # dangling partial sentence so the essay ends on a clean boundary.

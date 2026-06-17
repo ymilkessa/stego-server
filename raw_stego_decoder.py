@@ -16,9 +16,20 @@ def bits2int(bits):
     return res
 
 def int2bits(inp, num_bits):
-    """Convert integer to bit array (LSB first)"""
+    """Convert integer to bit array (LSB first), exactly num_bits long.
+
+    The input is taken modulo 2**num_bits so the result is ALWAYS exactly
+    num_bits bits. This matters at the arithmetic-coding interval boundaries: a
+    degenerate (zero-width) top bin can have a bound equal to 2**num_bits (=
+    max_val, which is just out of the num_bits range), and a bottom bound can
+    momentarily be -1. Without the mask, str-formatting those yields num_bits+1
+    chars (or a stray '-'), which breaks the equal-length invariant that
+    num_same_from_beg relies on. Masking wraps them back into range -- the
+    correct precision-bit register semantics -- and leaves every in-range value
+    [0, 2**num_bits) untouched."""
     if num_bits == 0:
         return []
+    inp &= (1 << num_bits) - 1
     strlist = ('{0:0%db}' % num_bits).format(inp)
     return [int(strval) for strval in reversed(strlist)]
 
@@ -57,7 +68,8 @@ def bits_to_hex(bits):
 
 def decode_steganographic(model, tokenizer, stego_text, context_text,
                          temp=1.0, precision=16, topk=50000, verbose=False,
-                         mask_fn=None, step_hook=None, done_fn=None):
+                         mask_fn=None, step_hook=None, done_fn=None,
+                         context_prefix=""):
     """
     Decode message bits from steganographic text using arithmetic coding
 
@@ -87,16 +99,25 @@ def decode_steganographic(model, tokenizer, stego_text, context_text,
             length-prefixed frame is satisfied and never reads into the
             cover-text continuation that complete_text encoding appends. If
             None, every token is decoded (legacy behavior).
+        context_prefix: Optional internal steering prompt that was prepended to
+            the model context during encoding. The SAME string is prepended here
+            so the model conditions on identical context, but every user-facing
+            offset (the done_len/word_len the GUI uses, the returned bits) stays
+            relative to the un-prefixed text -- the prefix is invisible to the
+            caller and never counted in the context length or output.
 
     Returns:
         List of decoded message bits
     """
-    # Tokenize the full steganographic text
-    full_tokens = tokenizer.encode(stego_text, return_tensors="pt")
+    # Tokenize the full steganographic text. The internal context_prefix (if any)
+    # was part of the model context during encoding, so prepend it here too; the
+    # generated-token slice below then lines up exactly with what was encoded.
+    full_tokens = tokenizer.encode(context_prefix + stego_text, return_tensors="pt")
     full_tokens = full_tokens.to(model.device)
-    
-    # Tokenize just the context to find where generated text starts
-    context_tokens = tokenizer.encode(context_text, return_tensors="pt")
+
+    # Tokenize just the (prefixed) context to find where generated text starts.
+    context_tokens = tokenizer.encode(context_prefix + context_text,
+                                      return_tensors="pt")
     context_tokens = context_tokens.to(model.device)
     
     # Limit context length to avoid memory issues

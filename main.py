@@ -19,11 +19,24 @@ import torch
 # default_model_id = "openai-community/gpt2"
 default_model_id = "meta-llama/Llama-3.2-1B"
 
+# Internal steering prompt prepended to the MODEL context (never shown to the
+# user). Base models like Llama-3.2-1B tend to ramble forever without emitting
+# EOS; this nudges the model to actually finish so the cover-text completion
+# terminates promptly. Both /encode and /decode prepend the IDENTICAL string so
+# the model conditions on exactly the same context in each direction. It is
+# never part of the returned stego text and is excluded from every length and
+# offset (it is passed via the encoder/decoder `context_prefix` argument, which
+# keeps all user-facing accounting relative to the un-prefixed text).
+INTERNAL_PROMPT = "Complete this very short article in less than five paragraphs.\n\n"
+
 # Import the encoding/decoding functions from the raw modules
 from raw_stego_encoder import encode_steganographic
 from raw_stego_decoder import decode_steganographic
 from stego_codec import (make_mask_fn, text_to_message_bits,
                          message_bits_to_text, frame_is_complete)
+from debug_logging import (chain_hooks, log_request, EncodeDebugLogger,
+                          log_encode_result, DecodeDebugLogger,
+                          log_decode_result)
 
 # Load environment variables
 load_dotenv()
@@ -37,6 +50,13 @@ model_cache = {}
 # Server-side debugging flag - set to True when you want to debug
 verbose = False
 
+# --debug request logging flag (set when started with --debug). When True, each
+# /encode and /decode request is narrated to the console: the full request body,
+# the message-bit sequence built up token by token, the switch to cover text,
+# and the final output. See debug_logging.py. Distinct from `verbose` (raw
+# per-token model internals) and from Flask's own DEBUG reloader.
+DEBUG_LOG = False
+
 # Optional step-by-step GUI bridge (set when started with --add-gui)
 GUI_BRIDGE = None
 
@@ -45,6 +65,12 @@ def set_gui_bridge(bridge):
     """Register the GUI bridge so /encode drives the step visualizer."""
     global GUI_BRIDGE
     GUI_BRIDGE = bridge
+
+
+def set_debug_log(enabled):
+    """Enable/disable the --debug request logging."""
+    global DEBUG_LOG
+    DEBUG_LOG = enabled
 
 
 def get_model(model_id=None):
@@ -126,7 +152,11 @@ def encode_endpoint():
         "model_id": "meta-llama/Llama-3.2-1B",  // optional, default from server
         "temp": 1.2,                          // optional, default 1.2
         "precision": 16,                      // optional, default 16
-        "topk": 50000                         // optional, default 50000
+        "topk": 50000,                        // optional, default 50000
+        "complete_essay": 1                   // optional; 1 = keep writing until
+                                              //   EOS (full article). Absent or
+                                              //   != 1 (default) = stop as soon
+                                              //   as the message is encoded.
     }
 
     Response:
@@ -134,7 +164,7 @@ def encode_endpoint():
         "success": true,
         "stego_text": "Hello world companies like...",
         "starter_length": 25,                 // length of starting text in characters
-        "config": { "model_id": ..., "temp": 1.2, "precision": 16, "topk": 50000 },
+        "config": { "model_id": ..., "temp": 1.2, "precision": 16, "topk": 50000, "complete_essay": false },
         "stats": {
             "message_chars": 14,
             "message_bytes": 14,
@@ -148,6 +178,9 @@ def encode_endpoint():
         data = request.get_json()
         if not data:
             return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        if DEBUG_LOG:
+            log_request('/encode', data)
 
         # Extract required parameters
         message = data.get('message')
@@ -167,6 +200,12 @@ def encode_endpoint():
         precision = data.get('precision', 16)
         topk = data.get('topk', 50000)
 
+        # complete_essay: only when explicitly set to 1 does the encoder keep
+        # sampling cover tokens until the model emits EOS (a full article, which
+        # can be slow). Absent or anything other than 1 -> stop the moment the
+        # message is fully encoded and return just that text (the fast default).
+        complete_text = str(data.get('complete_essay')) == '1'
+
         # Get model from cache (loads if not cached)
         model, tokenizer = get_model(model_id)
 
@@ -185,13 +224,19 @@ def encode_endpoint():
                                "start_text": start_text})
             step_hook = gui.hook
 
+        # Attach the debug step hook (alongside the GUI hook if present).
+        if DEBUG_LOG:
+            enc_logger = EncodeDebugLogger(len(message_bits), message_bits)
+            step_hook = chain_hooks(step_hook, enc_logger.hook)
+
         try:
             # Encode steganographically using imported function
             print(f"Encoding steganographic text...")
             generated_tokens = encode_steganographic(
                 model, tokenizer, message_bits, start_text,
                 temp=temp, precision=precision, topk=topk, verbose=verbose,
-                step_hook=step_hook, mask_fn=mask_fn, complete_text=True
+                step_hook=step_hook, mask_fn=mask_fn, complete_text=complete_text,
+                context_prefix=INTERNAL_PROMPT
             )
             print(f"Just finished encoding steganographic text...")
 
@@ -214,7 +259,8 @@ def encode_endpoint():
                 "model_id": model_id,
                 "temp": temp,
                 "precision": precision,
-                "topk": topk
+                "topk": topk,
+                "complete_essay": complete_text
             },
             "stats": {
                 "message_chars": len(message),
@@ -226,11 +272,22 @@ def encode_endpoint():
 
         print(f"Response: {response}")
 
+        if DEBUG_LOG:
+            log_encode_result(full_stego_text, response)
+
         return jsonify(response)
 
     except Exception as e:
+        # Always surface the full traceback to the console: a crash mid-encode
+        # (e.g. the model hitting EOS early -> degenerate distribution) is
+        # exactly what we most need to see when debugging.
+        print("\n" + "!" * 80)
+        print(f"[encode] ENCODING FAILED: {type(e).__name__}: {e}")
+        print("!" * 80)
+        traceback.print_exc()
+        print("!" * 80 + "\n")
         error_msg = f"Encoding error: {str(e)}"
-        if verbose:
+        if verbose or DEBUG_LOG:
             error_msg += f"\n{traceback.format_exc()}"
         return jsonify({"success": False, "error": error_msg}), 500
 
@@ -267,6 +324,9 @@ def decode_endpoint():
         data = request.get_json()
         if not data:
             return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        if DEBUG_LOG:
+            log_request('/decode', data)
 
         # Extract required parameters
         stego_text = data.get('stego_text')
@@ -313,11 +373,17 @@ def decode_endpoint():
                                "start_text": start_text})
             step_hook = gui.hook
 
+        # Attach the debug step hook (alongside the GUI hook if present).
+        if DEBUG_LOG:
+            dec_logger = DecodeDebugLogger()
+            step_hook = chain_hooks(step_hook, dec_logger.hook)
+
         try:
             recovered_bits = decode_steganographic(
                 model, tokenizer, stego_text, start_text,
                 temp=temp, precision=precision, topk=topk, verbose=verbose,
-                mask_fn=mask_fn, step_hook=step_hook, done_fn=frame_is_complete
+                mask_fn=mask_fn, step_hook=step_hook, done_fn=frame_is_complete,
+                context_prefix=INTERNAL_PROMPT
             )
 
             if not recovered_bits:
@@ -353,11 +419,20 @@ def decode_endpoint():
             }
         }
 
+        if DEBUG_LOG:
+            log_decode_result(message, integrity_ok, response)
+
         return jsonify(response)
-        
+
     except Exception as e:
+        # Always surface the full traceback to the console, mirroring /encode.
+        print("\n" + "!" * 80)
+        print(f"[decode] DECODING FAILED: {type(e).__name__}: {e}")
+        print("!" * 80)
+        traceback.print_exc()
+        print("!" * 80 + "\n")
         error_msg = f"Decoding error: {str(e)}"
-        if verbose:
+        if verbose or DEBUG_LOG:
             error_msg += f"\n{traceback.format_exc()}"
         return jsonify({"success": False, "error": error_msg}), 500
 
@@ -467,10 +542,19 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Steganographic API Server")
     parser.add_argument('--add-gui', action='store_true',
                         help="Launch a step-by-step encoding visualizer window")
+    parser.add_argument('--debug', action='store_true',
+                        help="Log each /encode and /decode request to the console: "
+                             "the full request body, the message-bit sequence built "
+                             "up token by token, the switch to cover text, and the "
+                             "final output.")
     args = parser.parse_args()
+
+    set_debug_log(args.debug)
 
     print("Starting Steganographic API Server...")
     print(f"Default model: {default_model_id}")
+    if args.debug:
+        print("Debug request logging: ON (--debug)")
 
     # Preload default model for faster first requests
     preload_default_model()
