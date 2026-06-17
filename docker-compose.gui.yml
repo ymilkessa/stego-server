@@ -1,0 +1,31 @@
+# Overlay that enables the --add-gui Tkinter visualizer in the container.
+#
+# Usage:  make gui            (preferred)
+#   or:   docker compose -f docker-compose.yml -f docker-compose.gui.yml up
+#
+# Tkinter has no display of its own, so it draws on an X server running on the
+# HOST. You must point the container at that X server and authorize it:
+#
+#   macOS  — install + run XQuartz, enable
+#            "Preferences > Security > Allow connections from network clients",
+#            then in a terminal:
+#                xhost + 127.0.0.1
+#                DISPLAY=host.docker.internal:0 make gui
+#
+#   Linux  — share the host X11 socket (mounted below) and authorize Docker:
+#                xhost +local:docker
+#                make gui
+#            (DISPLAY is inherited from your shell automatically.)
+
+services:
+  stego-server:
+    environment:
+      # Tells the container to launch with --add-gui (see Dockerfile CMD).
+      - ADD_GUI=1
+      # Where to draw. On Linux this is the inherited :0; on macOS export
+      # DISPLAY=host.docker.internal:0 before running (see header).
+      - DISPLAY=${DISPLAY}
+    volumes:
+      # Host X11 socket — used on Linux. Harmless/unused on macOS, which
+      # reaches XQuartz over TCP via host.docker.internal instead.
+      - /tmp/.X11-unix:/tmp/.X11-unix

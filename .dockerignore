@@ -1,0 +1,27 @@
+# Secrets — must never be baked into the image. The HF token is injected at
+# runtime via docker-compose env_file instead.
+.env
+.test_keys
+
+# VCS / tooling
+.git
+.gitignore
+.claude/
+__pycache__/
+*.pyc
+
+# Bulky reference material and docs not needed at runtime
+meteor_p_1-15.tex
+meteor-stego-paper.md
+meteor-figure9-iphone.png
+*.md
+
+# Frontend lives elsewhere; the server image doesn't need it
+interface/
+
+# Docker scaffolding itself
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.gui.yml
+Makefile

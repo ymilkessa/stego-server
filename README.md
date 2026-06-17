@@ -30,6 +30,90 @@ pipenv run python main.py
 
 The server will start on `http://localhost:3000` by default.
 
+## Running with Docker
+
+Docker lets the small language model be **downloaded once and reused** across
+restarts. The model weights are not baked into the image; on first run they are
+fetched into the HuggingFace cache (`HF_HOME=/models`), which is mounted as a
+named Docker volume (`stego-models`). Stopping or removing the container keeps
+that volume intact — only the explicit cleanup command below wipes the model.
+
+You still need a `.env` with `HUGGING_FACE_HUB_TOKEN` (see above); it is passed
+to the container at runtime and never stored in the image.
+
+```bash
+make build        # build the image
+make up           # start the server (first run downloads the model)
+make logs         # follow logs — watch the model load
+make down         # stop the container; the model stays on disk
+```
+
+The server listens on `http://localhost:3000`. Set `PORT` in your shell to map a
+different host port (`PORT=8080 make up`).
+
+### Wiping the model from disk
+
+Closing the program does **not** remove the model. To delete the downloaded
+weights explicitly:
+
+```bash
+make clean-model  # stop the container and delete ONLY the model volume
+```
+
+Or remove everything (container, image, and the model volume):
+
+```bash
+make clean
+```
+
+Equivalent raw commands if you'd rather not use `make`:
+
+```bash
+docker compose up -d          # start
+docker compose down           # stop (model kept)
+docker volume rm stego-models # wipe the downloaded model
+```
+
+### Step-by-step GUI (`--add-gui`) in the container
+
+The Tkinter visualizer also runs in the container, but Tkinter has no display of
+its own — it draws its window on an **X server running on your host**. So the
+container has to be pointed at that X server (`DISPLAY`) and the host has to
+authorize the connection. The image already includes the Tk libraries.
+
+**macOS** — Docker runs in a Linux VM and can't use the Mac's native windowing,
+so you need [XQuartz](https://www.xquartz.org/):
+
+1. Install and launch XQuartz.
+2. In XQuartz → Preferences → Security, enable **"Allow connections from network
+   clients"**, then restart XQuartz.
+3. Allow the connection and run:
+
+   ```bash
+   xhost + 127.0.0.1
+   DISPLAY=host.docker.internal:0 make gui
+   ```
+
+**Linux** — share the host's X11 socket (already mounted by the overlay) and
+authorize Docker:
+
+```bash
+xhost +local:docker
+make gui
+```
+
+`make gui` runs in the **foreground** (Tk must own the main thread, and the
+window stays attached to your terminal). Send an `/encode` request from another
+terminal to step through encoding. Under the hood it adds an overlay compose
+file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gui.yml up
+```
+
+> If you see `couldn't connect to display`, the X server isn't reachable or
+> isn't authorized — recheck the `xhost`/XQuartz network-clients steps above.
+
 ## API Endpoints
 
 ### POST /encode

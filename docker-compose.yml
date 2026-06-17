@@ -1,0 +1,22 @@
+services:
+  stego-server:
+    build: .
+    image: stego-server
+    container_name: stego-server
+    ports:
+      # Host port (override with PORT in your shell) -> fixed in-container 3000.
+      - "${PORT:-3000}:3000"
+    env_file:
+      # Supplies HUGGING_FACE_HUB_TOKEN (and any optional DEBUG). Never baked
+      # into the image — read fresh at runtime.
+      - .env
+    volumes:
+      # Persist the downloaded model. Closing/removing the container does NOT
+      # wipe this; only `make clean-model` (or removing the volume) does.
+      - stego-models:/models
+    restart: unless-stopped
+
+volumes:
+  stego-models:
+    # Explicit name so cleanup is predictable regardless of project name.
+    name: stego-models
