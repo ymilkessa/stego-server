@@ -139,8 +139,34 @@ class StegoGui:
                                      font=("Menlo", 12, "bold"))
         self.bits_text.configure(state="disabled")
 
-        ttk.Label(body, text="Model output options — by probability "
-                  "(probability range shown in binary):").pack(anchor="w")
+        # Cipher-text bit sequence (message ⊕ mask) + the mask. Shown above the
+        # column of logits since it is what drives the upcoming selection.
+        self.hack_var = tk.StringVar(value="")
+        self.hack_lbl = tk.Label(body, textvariable=self.hack_var,
+                                 fg="#ffffff", font=("Menlo", 11, "bold"))
+        self.hack_lbl.pack(anchor="w", pady=(0, 8))
+
+        # Decode mode: the upcoming words to decode, shown directly above the
+        # candidate column so the user can match the current target word to a
+        # candidate token BEFORE the selection is revealed. Hidden in encode
+        # mode (packed/unpacked per session in _reset_counters).
+        self.nextwords_frame = ttk.Frame(body)
+        ttk.Label(self.nextwords_frame,
+                  text="Next words to decode "
+                  "(bold green = current target — find it among the candidates "
+                  "below):").pack(anchor="w")
+        self.nextwords_text = tk.Text(self.nextwords_frame, height=2,
+                                      wrap="word", font=("Menlo", 13))
+        self.nextwords_text.tag_configure("target", foreground="#0a7d00",
+                                          font=("Menlo", 13, "bold"))
+        self.nextwords_text.tag_configure("upcoming", foreground="#555555")
+        self.nextwords_text.pack(fill="x", pady=(2, 8))
+        self.nextwords_text.configure(state="disabled")
+
+        self.model_opts_lbl = ttk.Label(
+            body, text="Model output options — by probability "
+            "(probability range shown in binary):")
+        self.model_opts_lbl.pack(anchor="w")
 
         tree_frame = ttk.Frame(body)
         tree_frame.pack(fill="both", expand=True)
@@ -168,11 +194,6 @@ class StegoGui:
         self.reveal_lbl = ttk.Label(body, textvariable=self.reveal_var,
                                     font=("TkDefaultFont", 13))
         self.reveal_lbl.pack(anchor="w", pady=(8, 0))
-
-        self.hack_var = tk.StringVar(value="")
-        self.hack_lbl = tk.Label(body, textvariable=self.hack_var,
-                                 fg="#3060a0", font=("Menlo", 11))
-        self.hack_lbl.pack(anchor="w")
 
         self.next_btn = ttk.Button(body, text="Next ▸", command=self._on_next)
         self.next_btn.pack(anchor="e", pady=6)
@@ -214,7 +235,9 @@ class StegoGui:
                 "(grey = starter, bold = current word, green = just decoded):")
             preview = self.stego_text[:60]
             self.status_var.set(f"Decoding started — stego_text={preview!r}…")
+            self.nextwords_frame.pack(fill="x", before=self.model_opts_lbl)
         else:
+            self.nextwords_frame.pack_forget()
             self.top_label_var.set(
                 "Bit sequence being encoded "
                 "(grey = done, bold = current window, green = just encoded):")
@@ -232,6 +255,9 @@ class StegoGui:
         self.item_to_rank.clear()
         self.reveal_var.set("")
         self.hack_var.set("")
+        self.nextwords_text.configure(state="normal")
+        self.nextwords_text.delete("1.0", "end")
+        self.nextwords_text.configure(state="disabled")
 
     def _set_output(self, text):
         self.output_text.configure(state="normal")
@@ -308,6 +334,7 @@ class StegoGui:
             f"{payload['bits_after'] if reveal else payload['bits_before']}")
         if self.mode == "decode":
             self._render_stego(payload, reveal)
+            self._render_nextwords(payload)
         else:
             self._render_bits(payload, reveal)
         self._render_candidates(payload, reveal)
@@ -398,6 +425,28 @@ class StegoGui:
         else:
             self.reveal_var.set("Next word hidden — click Next to reveal which "
                                 "candidate is the next word in the stego-text.")
+
+    def _render_nextwords(self, payload):
+        """Decode mode: show the upcoming words to decode (always, regardless of
+        reveal) right above the candidate column. The current target word is
+        emphasized; the words after it give context for matching it to a
+        candidate token."""
+        start = payload.get("done_len", self.starter_len)
+        wlen = payload.get("word_len", 0)
+        remaining = self.stego_text[start:]
+        window = remaining[:100]
+        truncated = len(remaining) > len(window)
+        self.nextwords_text.configure(state="normal")
+        self.nextwords_text.delete("1.0", "end")
+        self.nextwords_text.insert("1.0", window)
+        if truncated:
+            self.nextwords_text.insert("end", " …")
+        if wlen:
+            self.nextwords_text.tag_add("target", "1.0", f"1.0+{wlen}c")
+        if len(window) > wlen:
+            self.nextwords_text.tag_add(
+                "upcoming", f"1.0+{wlen}c", f"1.0+{len(window)}c")
+        self.nextwords_text.configure(state="disabled")
 
     def _render_stego(self, payload, reveal):
         """Decode mode: show the full stego-text with the current word marked."""
